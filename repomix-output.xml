@@ -1,0 +1,3484 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: **/build/**, **/dist/**, **/*.lock
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  main/
+    java/
+      com/
+        ezeebit/
+          wallet/
+            domain/
+              Account.java
+              ConversionQuote.java
+              CurrencyDefinition.java
+              LedgerEntry.java
+              Merchant.java
+              MoneyTransaction.java
+              TransactionStatus.java
+              TransactionType.java
+              Withdrawal.java
+            exception/
+              CurrencyMismatchException.java
+              ExchangeRateUnavailableException.java
+              InsufficientBalanceException.java
+              InvalidRequestException.java
+              NotFoundException.java
+              QuoteAlreadyUsedException.java
+              QuoteExpiredException.java
+            repository/
+              AccountRepository.java
+              ConversionQuoteRepository.java
+              CurrencyDefinitionRepository.java
+              LedgerEntryRepository.java
+              MerchantRepository.java
+              TransactionRepository.java
+              WithdrawalRepository.java
+            service/
+              exchangerate/
+                ExchangeRateClient.java
+                MockExchangeRateClient.java
+              payout/
+                MockPayoutRailClient.java
+                PayoutCallbackHandler.java
+                PayoutRailClient.java
+              AccountProvisioner.java
+              AccountService.java
+              ConversionExecutor.java
+              ConversionService.java
+              DepositExecutor.java
+              DepositService.java
+              TransactionService.java
+              WithdrawalExecutor.java
+              WithdrawalService.java
+            web/
+              dto/
+                BalanceResponse.java
+                ConversionRequest.java
+                DepositRequest.java
+                PayoutCallbackRequest.java
+                QuoteRequest.java
+                QuoteResponse.java
+                TransactionResponse.java
+                WithdrawalRequest.java
+                WithdrawalResponse.java
+              ApiError.java
+              BalanceController.java
+              ConversionController.java
+              DepositController.java
+              GlobalExceptionHandler.java
+              PayoutWebhookController.java
+              WithdrawalController.java
+            WalletApplication.java
+    resources/
+      db/
+        migration/
+          V1__init_schema.sql
+          V2__seed_reference_data.sql
+      application.yml
+  test/
+    java/
+      com/
+        ezeebit/
+          wallet/
+            service/
+              AccountServiceTest.java
+              ConversionExecutorTest.java
+              ConversionServiceTest.java
+              DepositServiceTest.java
+              TransactionServiceTest.java
+              WithdrawalExecutorTest.java
+              WithdrawalServiceTest.java
+pom.xml
+README.md
+SOLUTION.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/main/java/com/ezeebit/wallet/domain/Account.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+
+/**
+ * A merchant's balance in a single currency. Never mixes currencies -
+ * a merchant with ZAR and USDT has two Account rows, each independently
+ * accounted for. `balanceMinor` is a cached, authoritative snapshot that is
+ * always mutated in the same DB transaction as the LedgerEntry rows that
+ * justify the change, under a row lock (see AccountService).
+ */
+@Entity
+@Table(name = "accounts")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class Account {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "merchant_id", nullable = false)
+    private Long merchantId;
+
+    @Column(name = "currency_code", nullable = false, length = 10)
+    private String currencyCode;
+
+    @Column(name = "balance_minor", nullable = false)
+    private long balanceMinor;
+
+    @Version
+    @Column(name = "version", nullable = false)
+    private long version;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @PrePersist
+    void onCreate() {
+        Instant now = Instant.now();
+        createdAt = now;
+        updatedAt = now;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        updatedAt = Instant.now();
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/ConversionQuote.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * A short-lived, locked-in price for a currency conversion. The merchant
+ * fetches a quote, then executes against the quote id (not "the current
+ * market rate"). This is what stops the platform ending up on the wrong
+ * side of a moving market: the rate is fixed the moment the quote is
+ * created, and the quote expires quickly (see ezeebit.conversion.quote-ttl-seconds)
+ * so Ezeebit's own exposure to that fixed rate is bounded and short.
+ */
+@Entity
+@Table(name = "conversion_quotes")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class ConversionQuote {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Builder.Default
+    @Column(name = "public_id", nullable = false, updatable = false, unique = true)
+    private String publicId = UUID.randomUUID().toString();
+
+    @Column(name = "merchant_id", nullable = false)
+    private Long merchantId;
+
+    @Column(name = "from_currency", nullable = false, length = 10)
+    private String fromCurrency;
+
+    @Column(name = "to_currency", nullable = false, length = 10)
+    private String toCurrency;
+
+    @Column(name = "from_amount_minor", nullable = false)
+    private long fromAmountMinor;
+
+    @Column(name = "to_amount_minor", nullable = false)
+    private long toAmountMinor;
+
+    @Column(nullable = false, precision = 24, scale = 10)
+    private BigDecimal rate;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private QuoteStatus status;
+
+    @Column(name = "expires_at", nullable = false)
+    private Instant expiresAt;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @PrePersist
+    void onCreate() {
+        createdAt = Instant.now();
+    }
+
+    public boolean isExpired() {
+        return Instant.now().isAfter(expiresAt);
+    }
+
+    public enum QuoteStatus { ACTIVE, USED, EXPIRED }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/CurrencyDefinition.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "currency_definitions")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class CurrencyDefinition {
+
+    @Id
+    @Column(name = "code", length = 10)
+    private String code;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "currency_type", nullable = false)
+    private CurrencyType currencyType;
+
+    /** How many decimal places this currency is expressed in, e.g. 2 for ZAR, 6 for USDT. */
+    @Column(nullable = false)
+    private int decimals;
+
+    public enum CurrencyType { FIAT, CRYPTO }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/LedgerEntry.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+
+/**
+ * Immutable, append-only double-entry ledger row. Every MoneyTransaction
+ * produces a balanced set of these (debits == credits, per currency). This
+ * table is never updated or deleted - it is the permanent audit trail that
+ * answers "how did this balance reach its current value" for any account,
+ * at any point in the past.
+ */
+@Entity
+@Table(name = "ledger_entries")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class LedgerEntry {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "account_id", nullable = false)
+    private Long accountId;
+
+    @Column(name = "transaction_id", nullable = false)
+    private Long transactionId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "entry_type", nullable = false, length = 10)
+    private EntryType entryType;
+
+    @Column(name = "amount_minor", nullable = false)
+    private long amountMinor;
+
+    /** Snapshot of the account balance immediately after this entry was applied. */
+    @Column(name = "balance_after_minor", nullable = false)
+    private long balanceAfterMinor;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @PrePersist
+    void onCreate() {
+        createdAt = Instant.now();
+    }
+
+    public enum EntryType { DEBIT, CREDIT }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/Merchant.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+
+@Entity
+@Table(name = "merchants")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class Merchant {
+
+    /** Reserved id for Ezeebit's own clearing accounts. Not a real customer. */
+    public static final long SYSTEM_MERCHANT_ID = 0L;
+
+    @Id
+    private Long id;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(name = "is_system", nullable = false)
+    private boolean system;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/MoneyTransaction.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * One row per business operation (deposit / conversion / withdrawal). This is
+ * the idempotency boundary: (merchantId, idempotencyKey) is unique at the DB
+ * level, so a request replayed by a flaky mobile client can never be applied
+ * twice - the second insert fails with a constraint violation and the caller
+ * is handed back the original result instead.
+ */
+@Entity
+@Table(name = "transactions")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class MoneyTransaction {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Builder.Default
+    @Column(name = "public_id", nullable = false, updatable = false, unique = true)
+    private String publicId = UUID.randomUUID().toString();
+
+    @Column(name = "merchant_id", nullable = false)
+    private Long merchantId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 30)
+    private TransactionType type;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private TransactionStatus status;
+
+    @Column(name = "idempotency_key", nullable = false)
+    private String idempotencyKey;
+
+    @Column(name = "metadata_json")
+    private String metadataJson;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @PrePersist
+    void onCreate() {
+        Instant now = Instant.now();
+        createdAt = now;
+        updatedAt = now;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        updatedAt = Instant.now();
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/TransactionStatus.java">
+package com.ezeebit.wallet.domain;
+
+public enum TransactionStatus {
+    PENDING,
+    COMPLETED,
+    FAILED
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/TransactionType.java">
+package com.ezeebit.wallet.domain;
+
+public enum TransactionType {
+    DEPOSIT,
+    CONVERSION,
+    WITHDRAWAL,
+    WITHDRAWAL_REVERSAL
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/domain/Withdrawal.java">
+package com.ezeebit.wallet.domain;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * One payout request. The payout rail is asynchronous (see PayoutRailClient):
+ * we ask it to pay out, funds are reserved immediately, and some time later a
+ * callback tells us whether it succeeded or failed.
+ *
+ * PENDING     - funds have been reserved (debited) from the merchant's balance,
+ *               the rail has been asked to pay out, no callback yet.
+ * PROCESSING  - the rail has acknowledged the request (optional intermediate step,
+ *               used by slower rails).
+ * COMPLETED   - the rail confirmed success. Money has left the building; the
+ *               reservation is finalized.
+ * FAILED      - the rail confirmed failure (or timed out past its SLA). The
+ *               reserved funds are credited back to the merchant.
+ */
+@Entity
+@Table(name = "withdrawals")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class Withdrawal {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Builder.Default
+    @Column(name = "public_id", nullable = false, updatable = false, unique = true)
+    private String publicId = UUID.randomUUID().toString();
+
+    @Column(name = "merchant_id", nullable = false)
+    private Long merchantId;
+
+    @Column(name = "account_id", nullable = false)
+    private Long accountId;
+
+    @Column(name = "transaction_id", nullable = false)
+    private Long transactionId;
+
+    @Column(name = "amount_minor", nullable = false)
+    private long amountMinor;
+
+    @Column(name = "currency_code", nullable = false, length = 10)
+    private String currencyCode;
+
+    /** Bank account reference for fiat, or blockchain address for stablecoins. */
+    @Column(nullable = false)
+    private String destination;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private WithdrawalStatus status;
+
+    @Column(name = "idempotency_key", nullable = false)
+    private String idempotencyKey;
+
+    @Column(name = "external_ref")
+    private String externalRef;
+
+    @Column(name = "failure_reason", length = 500)
+    private String failureReason;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @PrePersist
+    void onCreate() {
+        Instant now = Instant.now();
+        createdAt = now;
+        updatedAt = now;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        updatedAt = Instant.now();
+    }
+
+    public enum WithdrawalStatus { PENDING, PROCESSING, COMPLETED, FAILED }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/CurrencyMismatchException.java">
+package com.ezeebit.wallet.exception;
+
+/** Thrown whenever an operation would mix two different currencies without an explicit conversion. */
+public class CurrencyMismatchException extends RuntimeException {
+    public CurrencyMismatchException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/ExchangeRateUnavailableException.java">
+package com.ezeebit.wallet.exception;
+
+/** The exchange-rate feed timed out, errored, or returned a rate that failed sanity checks. */
+public class ExchangeRateUnavailableException extends RuntimeException {
+    public ExchangeRateUnavailableException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    public ExchangeRateUnavailableException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/InsufficientBalanceException.java">
+package com.ezeebit.wallet.exception;
+
+public class InsufficientBalanceException extends RuntimeException {
+    public InsufficientBalanceException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/InvalidRequestException.java">
+package com.ezeebit.wallet.exception;
+
+public class InvalidRequestException extends RuntimeException {
+    public InvalidRequestException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/NotFoundException.java">
+package com.ezeebit.wallet.exception;
+
+public class NotFoundException extends RuntimeException {
+    public NotFoundException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/QuoteAlreadyUsedException.java">
+package com.ezeebit.wallet.exception;
+
+public class QuoteAlreadyUsedException extends RuntimeException {
+    public QuoteAlreadyUsedException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/exception/QuoteExpiredException.java">
+package com.ezeebit.wallet.exception;
+
+public class QuoteExpiredException extends RuntimeException {
+    public QuoteExpiredException(String message) {
+        super(message);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/AccountRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.Account;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+
+import java.util.List;
+import java.util.Optional;
+
+public interface AccountRepository extends JpaRepository<Account, Long> {
+
+    Optional<Account> findByMerchantIdAndCurrencyCode(Long merchantId, String currencyCode);
+
+    List<Account> findByMerchantId(Long merchantId);
+
+    /**
+     * Locks the account row for the duration of the current transaction
+     * (SELECT ... FOR UPDATE). Every method that mutates a balance must go
+     * through this, in a single @Transactional method, so that concurrent
+     * requests against the same account (duplicate withdrawals, a deposit
+     * racing a conversion, two withdrawals fired at once) are serialized by
+     * the database instead of racing in application memory.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select a from Account a where a.merchantId = :merchantId and a.currencyCode = :currencyCode")
+    Optional<Account> findForUpdate(Long merchantId, String currencyCode);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select a from Account a where a.id = :id")
+    Optional<Account> findByIdForUpdate(Long id);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/ConversionQuoteRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.ConversionQuote;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+
+import java.util.Optional;
+
+public interface ConversionQuoteRepository extends JpaRepository<ConversionQuote, Long> {
+
+    Optional<ConversionQuote> findByPublicId(String publicId);
+
+    /**
+     * Locked read used when *executing* a quote, so two concurrent attempts
+     * to spend the same quote can't both see it as ACTIVE.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select q from ConversionQuote q where q.publicId = :publicId")
+    Optional<ConversionQuote> findByPublicIdForUpdate(String publicId);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/CurrencyDefinitionRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.CurrencyDefinition;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface CurrencyDefinitionRepository extends JpaRepository<CurrencyDefinition, String> {
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/LedgerEntryRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.LedgerEntry;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.List;
+
+public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, Long> {
+
+    List<LedgerEntry> findByAccountIdOrderByIdAsc(Long accountId);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/MerchantRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.Merchant;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface MerchantRepository extends JpaRepository<Merchant, Long> {
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/TransactionRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface TransactionRepository extends JpaRepository<MoneyTransaction, Long> {
+
+    Optional<MoneyTransaction> findByMerchantIdAndIdempotencyKey(Long merchantId, String idempotencyKey);
+
+    Optional<MoneyTransaction> findByPublicId(String publicId);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/repository/WithdrawalRepository.java">
+package com.ezeebit.wallet.repository;
+
+import com.ezeebit.wallet.domain.Withdrawal;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+
+import java.util.Optional;
+
+public interface WithdrawalRepository extends JpaRepository<Withdrawal, Long> {
+
+    Optional<Withdrawal> findByMerchantIdAndIdempotencyKey(Long merchantId, String idempotencyKey);
+
+    Optional<Withdrawal> findByPublicId(String publicId);
+
+    Optional<Withdrawal> findByTransactionId(Long transactionId);
+
+    /** Locked read used when applying an async payout callback, so a duplicate
+     * webhook delivery can't apply the same success/failure transition twice. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select w from Withdrawal w where w.publicId = :publicId")
+    Optional<Withdrawal> findByPublicIdForUpdate(String publicId);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/exchangerate/ExchangeRateClient.java">
+package com.ezeebit.wallet.service.exchangerate;
+
+import java.math.BigDecimal;
+
+/**
+ * Stands in for the exchange-rate feed the brief says already exists.
+ * The brief warns it "can be slow and its price keeps moving" and that we
+ * should show how we'd handle a bad rate or a timeout - see
+ * {@link MockExchangeRateClient} for the simulated failure modes, and
+ * ConversionService for how a quote's rate is locked and validated.
+ */
+public interface ExchangeRateClient {
+
+    /**
+     * @return the price of one unit of {@code fromCurrency} expressed in
+     *         {@code toCurrency}, e.g. rate(USDT, ZAR) ~= 18.50
+     * @throws com.ezeebit.wallet.exception.ExchangeRateUnavailableException
+     *         if the feed times out, errors, or returns a rate that fails
+     *         a basic sanity check (non-positive, wildly out of range).
+     */
+    BigDecimal getRate(String fromCurrency, String toCurrency);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/exchangerate/MockExchangeRateClient.java">
+package com.ezeebit.wallet.service.exchangerate;
+
+import com.ezeebit.wallet.exception.ExchangeRateUnavailableException;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
+
+/**
+ * Stand-in for the real exchange-rate feed. Ships with rough, static
+ * baseline rates (not live data - fine for this exercise) plus a small
+ * amount of simulated jitter, so repeated quotes don't return identical
+ * numbers, mirroring "its price keeps moving".
+ *
+ * It also demonstrates defensive handling of an unreliable dependency:
+ * a small chance of a simulated timeout, and a sanity check that rejects
+ * a rate outside a plausible band rather than trusting it blindly.
+ */
+@Component
+public class MockExchangeRateClient implements ExchangeRateClient {
+
+    // Approximate ZAR-equivalent prices, purely illustrative.
+    private static final Map<String, BigDecimal> ZAR_PRICE = Map.of(
+            "ZAR", BigDecimal.ONE,
+            "NGN", new BigDecimal("0.012"),
+            "KES", new BigDecimal("0.14"),
+            "USDT", new BigDecimal("18.50"),
+            "USDC", new BigDecimal("18.50")
+    );
+
+    private static final BigDecimal MIN_SANE_RATE = new BigDecimal("0.0000001");
+    private static final BigDecimal MAX_SANE_RATE = new BigDecimal("100000000");
+
+    /** Set > 0 to simulate the feed being flaky in tests/demos. 0 by default. */
+    private volatile double simulatedTimeoutProbability = 0.0;
+
+    @Override
+    public BigDecimal getRate(String fromCurrency, String toCurrency) {
+        if (ThreadLocalRandom.current().nextDouble() < simulatedTimeoutProbability) {
+            throw new ExchangeRateUnavailableException(
+                    "Simulated timeout calling exchange rate feed for " + fromCurrency + "->" + toCurrency);
+        }
+
+        BigDecimal fromInZar = ZAR_PRICE.get(fromCurrency);
+        BigDecimal toInZar = ZAR_PRICE.get(toCurrency);
+        if (fromInZar == null || toInZar == null) {
+            throw new ExchangeRateUnavailableException(
+                    "No rate available for pair " + fromCurrency + "->" + toCurrency);
+        }
+
+        // +/- 0.5% jitter so the "price keeps moving" between quotes.
+        double jitter = 1.0 + (ThreadLocalRandom.current().nextDouble() - 0.5) * 0.01;
+        BigDecimal rate = fromInZar
+                .divide(toInZar, 12, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(jitter));
+
+        return sanityCheck(rate, fromCurrency, toCurrency);
+    }
+
+    private BigDecimal sanityCheck(BigDecimal rate, String from, String to) {
+        if (rate.compareTo(BigDecimal.ZERO) <= 0
+                || rate.compareTo(MIN_SANE_RATE) < 0
+                || rate.compareTo(MAX_SANE_RATE) > 0) {
+            throw new ExchangeRateUnavailableException(
+                    "Exchange rate feed returned an implausible rate for " + from + "->" + to + ": " + rate);
+        }
+        return rate;
+    }
+
+    /** Test/demo hook only. */
+    public void setSimulatedTimeoutProbability(double p) {
+        this.simulatedTimeoutProbability = p;
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/payout/MockPayoutRailClient.java">
+package com.ezeebit.wallet.service.payout;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.stereotype.Component;
+
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Simulates a real, asynchronous payout rail: `initiatePayout` returns
+ * immediately, and a background task calls back into the callback handler
+ * a few seconds later with a success or failure - the same shape a real
+ * rail's webhook would produce. In production this class is replaced by an
+ * HTTP client and the callback instead arrives at PayoutWebhookController;
+ * WithdrawalService's handling logic is identical either way.
+ */
+@Slf4j
+@Component
+public class MockPayoutRailClient implements PayoutRailClient {
+
+    private final PayoutCallbackHandler callbackHandler;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+
+    /** 0.0-1.0. Exposed for tests/demos that want to force a failing rail. */
+    private volatile double simulatedFailureProbability = 0.1;
+
+    public MockPayoutRailClient(@Lazy PayoutCallbackHandler callbackHandler) {
+        this.callbackHandler = callbackHandler;
+    }
+
+    @Override
+    public void initiatePayout(PayoutRequest request) {
+        long delayMillis = ThreadLocalRandom.current().nextLong(500, 2500);
+        scheduler.schedule(() -> {
+            try {
+                boolean success = ThreadLocalRandom.current().nextDouble() >= simulatedFailureProbability;
+                if (success) {
+                    callbackHandler.handlePayoutResult(
+                            request.withdrawalPublicId(), true, "rail-" + UUID.randomUUID(), null);
+                } else {
+                    callbackHandler.handlePayoutResult(
+                            request.withdrawalPublicId(), false, null, "Simulated rail rejection (insufficient rail liquidity)");
+                }
+            } catch (Exception e) {
+                log.error("Mock payout rail callback failed for {}", request.withdrawalPublicId(), e);
+            }
+        }, delayMillis, TimeUnit.MILLISECONDS);
+    }
+
+    public void setSimulatedFailureProbability(double p) {
+        this.simulatedFailureProbability = p;
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/payout/PayoutCallbackHandler.java">
+package com.ezeebit.wallet.service.payout;
+
+/**
+ * Implemented by WithdrawalService. This is the seam a real payout rail's
+ * webhook would call into (see PayoutWebhookController for the HTTP shape).
+ * Must be idempotent: the same withdrawal may be notified more than once.
+ */
+public interface PayoutCallbackHandler {
+
+    void handlePayoutResult(String withdrawalPublicId, boolean success, String externalRef, String failureReason);
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/payout/PayoutRailClient.java">
+package com.ezeebit.wallet.service.payout;
+
+/**
+ * Stands in for the payout rail the brief says already exists and is
+ * asynchronous: you ask it to pay out, and some time later it tells you
+ * whether it succeeded or failed via {@link PayoutCallbackHandler}.
+ *
+ * initiatePayout must be fire-and-forget from the caller's point of view -
+ * WithdrawalService reserves the funds and records a PENDING withdrawal
+ * *before* calling this, so a slow or lost rail response never leaves money
+ * unaccounted for.
+ */
+public interface PayoutRailClient {
+
+    void initiatePayout(PayoutRequest request);
+
+    record PayoutRequest(
+            String withdrawalPublicId,
+            String currencyCode,
+            long amountMinor,
+            String destination
+    ) {}
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/AccountProvisioner.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.Account;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.AccountRepository;
+import com.ezeebit.wallet.repository.CurrencyDefinitionRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Component
+@RequiredArgsConstructor
+public class AccountProvisioner {
+
+    private final AccountRepository accountRepository;
+    private final CurrencyDefinitionRepository currencyDefinitionRepository;
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void ensureAccountExists(Long merchantId, String currencyCode) {
+        if (accountRepository.findByMerchantIdAndCurrencyCode(merchantId, currencyCode).isPresent()) {
+            return;
+        }
+        if (!currencyDefinitionRepository.existsById(currencyCode)) {
+            throw new NotFoundException("Unknown currency: " + currencyCode);
+        }
+
+        accountRepository.saveAndFlush(Account.builder()
+                .merchantId(merchantId)
+                .currencyCode(currencyCode)
+                .balanceMinor(0L)
+                .build());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/AccountService.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.Account;
+import com.ezeebit.wallet.domain.LedgerEntry;
+import com.ezeebit.wallet.domain.Merchant;
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.exception.InsufficientBalanceException;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.AccountRepository;
+import com.ezeebit.wallet.repository.LedgerEntryRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class AccountService {
+
+    private final AccountRepository accountRepository;
+    private final LedgerEntryRepository ledgerEntryRepository;
+    private final AccountProvisioner accountProvisioner;
+
+    public List<Account> getBalances(Long merchantId) {
+        return accountRepository.findByMerchantId(merchantId);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Account lockExistingAccount(Long merchantId, String currencyCode) {
+        return accountRepository.findForUpdate(merchantId, currencyCode)
+                .orElseThrow(() -> new NotFoundException(
+                        "Merchant " + merchantId + " has no " + currencyCode + " account"));
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Account lockOrCreateAccount(Long merchantId, String currencyCode) {
+        // 1. Non-locking read check to avoid placing a gap lock prior to REQUIRES_NEW execution
+        if (accountRepository.findByMerchantIdAndCurrencyCode(merchantId, currencyCode).isEmpty()) {
+            try {
+                accountProvisioner.ensureAccountExists(merchantId, currencyCode);
+            } catch (Exception ignored) {
+                // A racing thread created the account and Tx B rolled back.
+                // The row now exists and can be locked safely below.
+            }
+        }
+
+        // 2. Now lock the row with FOR UPDATE
+        return accountRepository.findForUpdate(merchantId, currencyCode)
+                .orElseThrow(() -> new NotFoundException("Unknown currency: " + currencyCode));
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void credit(Account account, long amountMinor, MoneyTransaction transaction) {
+        requirePositive(amountMinor);
+        account.setBalanceMinor(account.getBalanceMinor() + amountMinor);
+        accountRepository.save(account);
+        ledgerEntryRepository.save(LedgerEntry.builder()
+                .accountId(account.getId())
+                .transactionId(transaction.getId())
+                .entryType(LedgerEntry.EntryType.CREDIT)
+                .amountMinor(amountMinor)
+                .balanceAfterMinor(account.getBalanceMinor())
+                .build());
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void debit(Account account, long amountMinor, MoneyTransaction transaction) {
+        requirePositive(amountMinor);
+        boolean isSystemFloatAccount = account.getMerchantId() == Merchant.SYSTEM_MERCHANT_ID;
+        if (!isSystemFloatAccount && account.getBalanceMinor() < amountMinor) {
+            throw new InsufficientBalanceException(
+                    "Merchant " + account.getMerchantId() + " holds " + account.getBalanceMinor()
+                            + " minor units of " + account.getCurrencyCode() + " but " + amountMinor + " were requested");
+        }
+        account.setBalanceMinor(account.getBalanceMinor() - amountMinor);
+        accountRepository.save(account);
+        ledgerEntryRepository.save(LedgerEntry.builder()
+                .accountId(account.getId())
+                .transactionId(transaction.getId())
+                .entryType(LedgerEntry.EntryType.DEBIT)
+                .amountMinor(amountMinor)
+                .balanceAfterMinor(account.getBalanceMinor())
+                .build());
+    }
+
+    public List<LedgerEntry> getStatement(Long accountId) {
+        return ledgerEntryRepository.findByAccountIdOrderByIdAsc(accountId);
+    }
+
+    private void requirePositive(long amountMinor) {
+        if (amountMinor <= 0) {
+            throw new IllegalArgumentException("Amount must be positive, got " + amountMinor);
+        }
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/ConversionExecutor.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.*;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.exception.QuoteAlreadyUsedException;
+import com.ezeebit.wallet.exception.QuoteExpiredException;
+import com.ezeebit.wallet.repository.ConversionQuoteRepository;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * See DepositExecutor for why this is a separate bean from ConversionService
+ * rather than a second method on it (Spring @Transactional + self-invocation).
+ */
+@Component
+@RequiredArgsConstructor
+public class ConversionExecutor {
+
+    private final AccountService accountService;
+    private final TransactionRepository transactionRepository;
+    private final ConversionQuoteRepository quoteRepository;
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void execute(MoneyTransaction transaction, Long merchantId, String quoteId) {
+        MoneyTransaction managedTx = transactionRepository.getReferenceById(transaction.getId());
+
+        ConversionQuote quote = quoteRepository.findByPublicIdForUpdate(quoteId)
+                .orElseThrow(() -> new NotFoundException("Unknown quote: " + quoteId));
+
+        if (!quote.getMerchantId().equals(merchantId)) {
+            throw new NotFoundException("Unknown quote: " + quoteId);
+        }
+        if (quote.getStatus() == ConversionQuote.QuoteStatus.USED) {
+            throw new QuoteAlreadyUsedException("Quote " + quoteId + " has already been used");
+        }
+        if (quote.getStatus() == ConversionQuote.QuoteStatus.EXPIRED || quote.isExpired()) {
+            // Note: this status write happens in a transaction we go on to throw
+            // out of below, so it will be rolled back. That's fine - isExpired()
+            // (a pure function of expiresAt) is the real source of truth; the
+            // persisted status is a best-effort convenience for humans browsing
+            // the table, not something anything else in the code depends on.
+            quote.setStatus(ConversionQuote.QuoteStatus.EXPIRED);
+            throw new QuoteExpiredException("Quote " + quoteId + " has expired; request a new one");
+        }
+
+        String fromCcy = quote.getFromCurrency();
+        String toCcy = quote.getToCurrency();
+
+        // Lock every account involved in a fixed, currency-alphabetical order
+        // (merchant accounts before the system's) so that two concurrent
+        // conversions - even in opposite directions between the same two
+        // currencies - can never deadlock against each other.
+        boolean fromFirst = fromCcy.compareTo(toCcy) <= 0;
+        String firstCcy = fromFirst ? fromCcy : toCcy;
+        String secondCcy = fromFirst ? toCcy : fromCcy;
+
+        Account merchantFirst = accountService.lockOrCreateAccount(merchantId, firstCcy);
+        Account merchantSecond = accountService.lockOrCreateAccount(merchantId, secondCcy);
+        Account systemFirst = accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, firstCcy);
+        Account systemSecond = accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, secondCcy);
+
+        Account merchantFrom = fromFirst ? merchantFirst : merchantSecond;
+        Account merchantTo = fromFirst ? merchantSecond : merchantFirst;
+        Account systemFrom = fromFirst ? systemFirst : systemSecond;
+        Account systemTo = fromFirst ? systemSecond : systemFirst;
+
+        // The merchant must never convert more than they actually hold - this
+        // is enforced here, under the lock, at execution time (not at quote
+        // time, when the balance could since have moved).
+        accountService.debit(merchantFrom, quote.getFromAmountMinor(), managedTx);
+        accountService.credit(systemFrom, quote.getFromAmountMinor(), managedTx);
+
+        accountService.debit(systemTo, quote.getToAmountMinor(), managedTx);
+        accountService.credit(merchantTo, quote.getToAmountMinor(), managedTx);
+
+        quote.setStatus(ConversionQuote.QuoteStatus.USED);
+        managedTx.setStatus(TransactionStatus.COMPLETED);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/ConversionService.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.CurrencyDefinition;
+import com.ezeebit.wallet.domain.ConversionQuote;
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.exception.InvalidRequestException;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.ConversionQuoteRepository;
+import com.ezeebit.wallet.repository.CurrencyDefinitionRepository;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.service.exchangerate.ExchangeRateClient;
+import com.ezeebit.wallet.web.dto.ConversionRequest;
+import com.ezeebit.wallet.web.dto.QuoteRequest;
+import com.ezeebit.wallet.web.dto.QuoteResponse;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+
+/**
+ * Task 2 - converting one currency a merchant holds into another.
+ *
+ * Design: quote-then-execute, so the merchant always converts at a price
+ * they saw and agreed to, never at "whatever the market is doing right
+ * now":
+ *
+ *   1. createQuote() calls the (slow, moving) exchange-rate feed once,
+ *      locks that rate into a short-lived ConversionQuote row, and hands
+ *      the merchant a quote id. No money moves yet, so no balance check
+ *      is needed here.
+ *   2. executeConversion() (via ConversionExecutor) spends a quote id. It
+ *      re-validates the quote (not expired, not already used, belongs to
+ *      this merchant), takes a lock on the merchant's balances, checks the
+ *      merchant actually holds the "from" amount *at execution time*, and
+ *      moves the money in one local transaction.
+ *
+ * A short quote TTL (ezeebit.conversion.quote-ttl-seconds) is what stops
+ * the platform ending up on the wrong side of a moving market: Ezeebit's
+ * price exposure on any one quote is bounded to that window, after which
+ * the merchant must ask for a fresh price.
+ *
+ * The conversion itself is posted as two independent, currency-scoped
+ * double-entry postings against a SYSTEM clearing account (see
+ * Merchant.SYSTEM_MERCHANT_ID and V2__seed_reference_data.sql):
+ *   debit  merchant/FROM_CCY  ->  credit SYSTEM/FROM_CCY
+ *   debit  SYSTEM/TO_CCY      ->  credit merchant/TO_CCY
+ * This keeps every single-currency ledger balanced (never mixes two
+ * currencies inside one entry) while still fully explaining where the
+ * money went.
+ */
+@Service
+@RequiredArgsConstructor
+public class ConversionService {
+
+    private final TransactionService transactionService;
+    private final TransactionRepository transactionRepository;
+    private final ConversionQuoteRepository quoteRepository;
+    private final CurrencyDefinitionRepository currencyDefinitionRepository;
+    private final ExchangeRateClient exchangeRateClient;
+    private final ConversionExecutor conversionExecutor;
+
+    @Value("${ezeebit.conversion.quote-ttl-seconds:20}")
+    private long quoteTtlSeconds;
+
+    // ---- Step 1: quote ----------------------------------------------------
+
+    public QuoteResponse createQuote(Long merchantId, QuoteRequest request) {
+        if (request.fromCurrency().equalsIgnoreCase(request.toCurrency())) {
+            throw new InvalidRequestException("fromCurrency and toCurrency must differ");
+        }
+        CurrencyDefinition from = currencyDefinitionRepository.findById(request.fromCurrency())
+                .orElseThrow(() -> new NotFoundException("Unknown currency: " + request.fromCurrency()));
+        CurrencyDefinition to = currencyDefinitionRepository.findById(request.toCurrency())
+                .orElseThrow(() -> new NotFoundException("Unknown currency: " + request.toCurrency()));
+
+        BigDecimal rate = exchangeRateClient.getRate(from.getCode(), to.getCode());
+
+        BigDecimal fromAmountMajor = minorToMajor(request.fromAmountMinor(), from.getDecimals());
+        BigDecimal toAmountMajor = fromAmountMajor.multiply(rate);
+        long toAmountMinor = majorToMinor(toAmountMajor, to.getDecimals());
+
+        if (toAmountMinor <= 0) {
+            throw new InvalidRequestException("Conversion amount too small to produce a non-zero result");
+        }
+
+        ConversionQuote quote = ConversionQuote.builder()
+                .merchantId(merchantId)
+                .fromCurrency(from.getCode())
+                .toCurrency(to.getCode())
+                .fromAmountMinor(request.fromAmountMinor())
+                .toAmountMinor(toAmountMinor)
+                .rate(rate)
+                .status(ConversionQuote.QuoteStatus.ACTIVE)
+                .expiresAt(Instant.now().plusSeconds(quoteTtlSeconds))
+                .build();
+        quoteRepository.save(quote);
+
+        return QuoteResponse.from(quote);
+    }
+
+    // ---- Step 2: execute ---------------------------------------------------
+
+    public TransactionResponse executeConversion(Long merchantId, ConversionRequest request) {
+        TransactionService.ClaimResult claim = transactionService.claim(
+                merchantId, TransactionType.CONVERSION, request.idempotencyKey(),
+                "{\"quoteId\":\"" + request.quoteId() + "\"}");
+
+        if (!claim.isNew()) {
+            return TransactionResponse.from(claim.transaction());
+        }
+
+        try {
+            conversionExecutor.execute(claim.transaction(), merchantId, request.quoteId());
+        } catch (RuntimeException e) {
+            transactionService.markFailed(claim.transaction().getId(), e.getMessage());
+            throw e;
+        }
+
+        return TransactionResponse.from(transactionRepository.findById(claim.transaction().getId()).orElseThrow());
+    }
+
+    private BigDecimal minorToMajor(long amountMinor, int decimals) {
+        return BigDecimal.valueOf(amountMinor).movePointLeft(decimals);
+    }
+
+    private long majorToMinor(BigDecimal amountMajor, int decimals) {
+        return amountMajor.movePointRight(decimals).setScale(0, RoundingMode.DOWN).longValueExact();
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/DepositExecutor.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.Account;
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.domain.TransactionStatus;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.web.dto.DepositRequest;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * Split out from DepositService as its own Spring bean deliberately: Spring's
+ * @Transactional is proxy-based, and a proxy is only consulted on a call that
+ * comes from *another* bean. If this method lived on DepositService and
+ * DepositService called it on itself (`this.execute(...)`), the REQUIRES_NEW
+ * annotation would silently be ignored. Routing the call through a separate
+ * bean guarantees the proxy - and therefore the transaction boundary - is
+ * actually applied.
+ */
+@Component
+@RequiredArgsConstructor
+public class DepositExecutor {
+
+    private final AccountService accountService;
+    private final TransactionRepository transactionRepository;
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void execute(MoneyTransaction transaction, Long merchantId, DepositRequest request) {
+        // `transaction` was loaded in TransactionService.claim()'s own transaction
+        // and is now detached; re-attach it here so the status change below
+        // is actually flushed as part of this transaction.
+        MoneyTransaction managed = transactionRepository.getReferenceById(transaction.getId());
+        Account account = accountService.lockOrCreateAccount(merchantId, request.currency());
+        accountService.credit(account, request.amountMinor(), managed);
+        managed.setStatus(TransactionStatus.COMPLETED);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/DepositService.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.web.dto.DepositRequest;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+/**
+ * Task 1 - holding a merchant's money across currencies. Money arrives (a
+ * deposit, e.g. an on-chain confirmation or a bank credit already validated
+ * upstream) and the merchant's balance in that currency goes up.
+ *
+ * Correctness properties:
+ *  - Idempotent: the same idempotencyKey applied twice never double-credits
+ *    (see TransactionService.claim).
+ *  - Currency-safe: money always lands in an Account scoped to exactly one
+ *    currency; there is no code path that adds an amount to the "wrong"
+ *    currency's balance.
+ *  - Auditable: every credit is backed by an immutable LedgerEntry.
+ */
+@Service
+@RequiredArgsConstructor
+public class DepositService {
+
+    private final TransactionService transactionService;
+    private final TransactionRepository transactionRepository;
+    private final DepositExecutor depositExecutor;
+
+    public TransactionResponse deposit(Long merchantId, DepositRequest request) {
+        TransactionService.ClaimResult claim = transactionService.claim(
+                merchantId, TransactionType.DEPOSIT, request.idempotencyKey(),
+                "{\"currency\":\"" + request.currency() + "\",\"amountMinor\":" + request.amountMinor() + "}");
+
+        if (!claim.isNew()) {
+            // Duplicate request (retry over a flaky connection): hand back the
+            // original outcome instead of crediting the account again.
+            return TransactionResponse.from(claim.transaction());
+        }
+
+        try {
+            depositExecutor.execute(claim.transaction(), merchantId, request);
+        } catch (RuntimeException e) {
+            transactionService.markFailed(claim.transaction().getId(), e.getMessage());
+            throw e;
+        }
+
+        return TransactionResponse.from(transactionRepository.findById(claim.transaction().getId()).orElseThrow());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/TransactionService.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.domain.TransactionStatus;
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
+
+@Service
+@RequiredArgsConstructor
+public class TransactionService {
+
+    private final TransactionRepository transactionRepository;
+
+    public record ClaimResult(MoneyTransaction transaction, boolean isNew) {}
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public ClaimResult claim(Long merchantId, TransactionType type, String idempotencyKey, String metadataJson) {
+        // 1. Read check first to avoid poisoning the Hibernate session on standard duplicate calls
+        Optional<MoneyTransaction> existing = transactionRepository
+                .findByMerchantIdAndIdempotencyKey(merchantId, idempotencyKey);
+
+        if (existing.isPresent()) {
+            return new ClaimResult(existing.get(), false);
+        }
+
+        // 2. Persist new transaction if none exists
+        try {
+            MoneyTransaction transaction = MoneyTransaction.builder()
+                    .merchantId(merchantId)
+                    .type(type)
+                    .status(TransactionStatus.PENDING)
+                    .idempotencyKey(idempotencyKey)
+                    .metadataJson(metadataJson)
+                    .build();
+
+            MoneyTransaction saved = transactionRepository.saveAndFlush(transaction);
+            return new ClaimResult(saved, true);
+        } catch (DataIntegrityViolationException duplicate) {
+            // Do NOT query transactionRepository here. The Session is rollback-only.
+            // Throwing allows REQUIRES_NEW to rollback cleanly so the caller can retry or fetch.
+            throw duplicate;
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void markCompleted(Long transactionId) {
+        MoneyTransaction tx = transactionRepository.getReferenceById(transactionId);
+        tx.setStatus(TransactionStatus.COMPLETED);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void markFailed(Long transactionId, String reason) {
+        MoneyTransaction tx = transactionRepository.getReferenceById(transactionId);
+        tx.setStatus(TransactionStatus.FAILED);
+        tx.setMetadataJson(appendFailure(tx.getMetadataJson(), reason));
+    }
+
+    private String appendFailure(String existingMetadata, String reason) {
+        String safeReason = reason == null ? "unknown error" : reason.replace("\"", "'");
+        String failureField = "\"failureReason\":\"" + safeReason + "\"";
+        if (existingMetadata == null || existingMetadata.isBlank()) {
+            return "{" + failureField + "}";
+        }
+        return existingMetadata.replaceFirst("}$", "," + failureField + "}");
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/WithdrawalExecutor.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.*;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.repository.WithdrawalRepository;
+import com.ezeebit.wallet.web.dto.WithdrawalRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * See DepositExecutor for why this is a separate bean from WithdrawalService
+ * rather than more methods on it (Spring @Transactional + self-invocation).
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class WithdrawalExecutor {
+
+    private final AccountService accountService;
+    private final TransactionRepository transactionRepository;
+    private final WithdrawalRepository withdrawalRepository;
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Withdrawal reserveFunds(MoneyTransaction transaction, Long merchantId, WithdrawalRequest request) {
+        MoneyTransaction managedTx = transactionRepository.getReferenceById(transaction.getId());
+
+        Account merchantAccount = accountService.lockExistingAccount(merchantId, request.currency());
+        Account systemSuspense = accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, request.currency());
+
+        accountService.debit(merchantAccount, request.amountMinor(), managedTx);
+        accountService.credit(systemSuspense, request.amountMinor(), managedTx);
+
+        Withdrawal withdrawal = Withdrawal.builder()
+                .merchantId(merchantId)
+                .accountId(merchantAccount.getId())
+                .transactionId(managedTx.getId())
+                .amountMinor(request.amountMinor())
+                .currencyCode(request.currency())
+                .destination(request.destination())
+                .status(Withdrawal.WithdrawalStatus.PENDING)
+                .idempotencyKey(request.idempotencyKey())
+                .build();
+        withdrawalRepository.save(withdrawal);
+        // MoneyTransaction stays PENDING - it only becomes COMPLETED/FAILED
+        // once the rail actually confirms the payout (see applyPayoutResult).
+        return withdrawal;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void applyPayoutResult(String withdrawalPublicId, boolean success, String externalRef, String failureReason) {
+        Withdrawal withdrawal = withdrawalRepository.findByPublicIdForUpdate(withdrawalPublicId)
+                .orElseThrow(() -> new NotFoundException("Unknown withdrawal: " + withdrawalPublicId));
+
+        if (withdrawal.getStatus() != Withdrawal.WithdrawalStatus.PENDING
+                && withdrawal.getStatus() != Withdrawal.WithdrawalStatus.PROCESSING) {
+            // Already terminal - the rail redelivered a notification we've already
+            // applied. Do nothing, so a duplicate callback can never double-apply.
+            log.info("Ignoring duplicate payout callback for withdrawal {} (already {})",
+                    withdrawalPublicId, withdrawal.getStatus());
+            return;
+        }
+
+        MoneyTransaction originalTx = transactionRepository.getReferenceById(withdrawal.getTransactionId());
+
+        if (success) {
+            Account systemSuspense = accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, withdrawal.getCurrencyCode());
+            accountService.debit(systemSuspense, withdrawal.getAmountMinor(), originalTx);
+
+            withdrawal.setStatus(Withdrawal.WithdrawalStatus.COMPLETED);
+            withdrawal.setExternalRef(externalRef);
+            originalTx.setStatus(TransactionStatus.COMPLETED);
+        } else {
+            reverseReservation(withdrawal, originalTx, failureReason);
+        }
+    }
+
+    private void reverseReservation(Withdrawal withdrawal, MoneyTransaction originalTx, String failureReason) {
+        MoneyTransaction reversal = MoneyTransaction.builder()
+                .merchantId(withdrawal.getMerchantId())
+                .type(TransactionType.WITHDRAWAL_REVERSAL)
+                .status(TransactionStatus.COMPLETED)
+                .idempotencyKey(withdrawal.getIdempotencyKey() + ":reversal")
+                .metadataJson("{\"withdrawalId\":\"" + withdrawal.getPublicId() + "\"}")
+                .build();
+        transactionRepository.save(reversal);
+
+        Account merchantAccount = accountService.lockOrCreateAccount(withdrawal.getMerchantId(), withdrawal.getCurrencyCode());
+        Account systemSuspense = accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, withdrawal.getCurrencyCode());
+
+        accountService.debit(systemSuspense, withdrawal.getAmountMinor(), reversal);
+        accountService.credit(merchantAccount, withdrawal.getAmountMinor(), reversal);
+
+        withdrawal.setStatus(Withdrawal.WithdrawalStatus.FAILED);
+        withdrawal.setFailureReason(failureReason);
+        originalTx.setStatus(TransactionStatus.FAILED);
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/service/WithdrawalService.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.domain.Withdrawal;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.WithdrawalRepository;
+import com.ezeebit.wallet.service.payout.PayoutCallbackHandler;
+import com.ezeebit.wallet.service.payout.PayoutRailClient;
+import com.ezeebit.wallet.web.dto.WithdrawalRequest;
+import com.ezeebit.wallet.web.dto.WithdrawalResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+/**
+ * Task 3 - withdrawing funds out of the platform.
+ *
+ * The payout rail is asynchronous, so this is a two-phase flow:
+ *
+ *  1. initiateWithdrawal(): under a lock on the merchant's account (see
+ *     WithdrawalExecutor.reserveFunds), checks the merchant actually holds
+ *     the funds and *immediately reserves them* by debiting the balance and
+ *     crediting a SYSTEM "withdrawal suspense" account - all inside one
+ *     local transaction, guarded by the same (merchantId, idempotencyKey)
+ *     claim used for deposits/conversions. Only after that transaction
+ *     commits do we ask the rail to pay out. This ordering means:
+ *       - the same withdrawal can never be paid out twice, because the
+ *         idempotency claim can only succeed once for a given key;
+ *       - a merchant can never withdraw money they don't have, because the
+ *         debit is checked and applied under a row lock before the rail is
+ *         ever called;
+ *       - a slow/lost rail response never leaves money unaccounted for -
+ *         the funds are already parked in the suspense account, visible in
+ *         the ledger, whether or not the rail ever calls back.
+ *
+ *  2. handlePayoutResult(): the rail's callback (mocked here, see
+ *     MockPayoutRailClient / PayoutWebhookController). Idempotent - a
+ *     duplicate notification for an already-terminal withdrawal is a no-op
+ *     (see WithdrawalExecutor.applyPayoutResult). On success, the suspense
+ *     entry is cleared (money has genuinely left). On failure, the
+ *     reservation is reversed via a brand new WITHDRAWAL_REVERSAL
+ *     transaction (we never edit history - a reversal is its own auditable
+ *     entry) crediting the merchant back in full.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class WithdrawalService implements PayoutCallbackHandler {
+
+    private final TransactionService transactionService;
+    private final WithdrawalRepository withdrawalRepository;
+    private final PayoutRailClient payoutRailClient;
+    private final WithdrawalExecutor withdrawalExecutor;
+
+    public WithdrawalResponse initiateWithdrawal(Long merchantId, WithdrawalRequest request) {
+        TransactionService.ClaimResult claim = transactionService.claim(
+                merchantId, TransactionType.WITHDRAWAL, request.idempotencyKey(),
+                "{\"currency\":\"" + request.currency() + "\",\"amountMinor\":" + request.amountMinor()
+                        + ",\"destination\":\"" + request.destination() + "\"}");
+
+        if (!claim.isNew()) {
+            return withdrawalRepository.findByTransactionId(claim.transaction().getId())
+                    .map(WithdrawalResponse::from)
+                    // Extremely narrow race: the transaction was claimed a moment ago by another
+                    // in-flight request but its Withdrawal row hasn't been inserted yet. Reflect
+                    // that the request is already being processed rather than creating a second one.
+                    .orElseGet(() -> new WithdrawalResponse(null, claim.transaction().getStatus().name(),
+                            request.currency(), request.amountMinor(), request.destination(), null,
+                            claim.transaction().getUpdatedAt()));
+        }
+
+        Withdrawal withdrawal;
+        try {
+            withdrawal = withdrawalExecutor.reserveFunds(claim.transaction(), merchantId, request);
+        } catch (RuntimeException e) {
+            transactionService.markFailed(claim.transaction().getId(), e.getMessage());
+            throw e;
+        }
+
+        // Only call the (external, unreliable) rail once our reservation has
+        // safely committed - never from inside the DB transaction above.
+        payoutRailClient.initiatePayout(new PayoutRailClient.PayoutRequest(
+                withdrawal.getPublicId(), withdrawal.getCurrencyCode(), withdrawal.getAmountMinor(), withdrawal.getDestination()));
+
+        return WithdrawalResponse.from(withdrawal);
+    }
+
+    @Override
+    public void handlePayoutResult(String withdrawalPublicId, boolean success, String externalRef, String failureReason) {
+        try {
+            withdrawalExecutor.applyPayoutResult(withdrawalPublicId, success, externalRef, failureReason);
+        } catch (NotFoundException e) {
+            log.warn("Payout callback for unknown withdrawal {}: {}", withdrawalPublicId, e.getMessage());
+            throw e;
+        }
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/BalanceResponse.java">
+package com.ezeebit.wallet.web.dto;
+
+import com.ezeebit.wallet.domain.Account;
+
+import java.time.Instant;
+
+public record BalanceResponse(
+        Long merchantId,
+        String currency,
+        long balanceMinor,
+        Instant updatedAt
+) {
+    public static BalanceResponse from(Account account) {
+        return new BalanceResponse(account.getMerchantId(), account.getCurrencyCode(),
+                account.getBalanceMinor(), account.getUpdatedAt());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/ConversionRequest.java">
+package com.ezeebit.wallet.web.dto;
+
+import jakarta.validation.constraints.NotBlank;
+
+public record ConversionRequest(
+        @NotBlank String quoteId,
+        @NotBlank String idempotencyKey
+) {}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/DepositRequest.java">
+package com.ezeebit.wallet.web.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
+
+public record DepositRequest(
+        @NotBlank String currency,
+        @Positive long amountMinor,
+        @NotBlank String idempotencyKey,
+        String reference
+) {}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/PayoutCallbackRequest.java">
+package com.ezeebit.wallet.web.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+
+/** Shape a real payout rail's webhook would post to PayoutWebhookController. */
+public record PayoutCallbackRequest(
+        @NotNull Boolean success,
+        String externalRef,
+        String failureReason
+) {}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/QuoteRequest.java">
+package com.ezeebit.wallet.web.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
+
+public record QuoteRequest(
+        @NotBlank String fromCurrency,
+        @NotBlank String toCurrency,
+        @Positive long fromAmountMinor
+) {}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/QuoteResponse.java">
+package com.ezeebit.wallet.web.dto;
+
+import com.ezeebit.wallet.domain.ConversionQuote;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+
+public record QuoteResponse(
+        String quoteId,
+        String fromCurrency,
+        String toCurrency,
+        long fromAmountMinor,
+        long toAmountMinor,
+        BigDecimal rate,
+        Instant expiresAt
+) {
+    public static QuoteResponse from(ConversionQuote q) {
+        return new QuoteResponse(q.getPublicId(), q.getFromCurrency(), q.getToCurrency(),
+                q.getFromAmountMinor(), q.getToAmountMinor(), q.getRate(), q.getExpiresAt());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/TransactionResponse.java">
+package com.ezeebit.wallet.web.dto;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+
+import java.time.Instant;
+
+public record TransactionResponse(
+        String transactionId,
+        String type,
+        String status,
+        Instant createdAt
+) {
+    public static TransactionResponse from(MoneyTransaction tx) {
+        return new TransactionResponse(tx.getPublicId(), tx.getType().name(), tx.getStatus().name(), tx.getCreatedAt());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/WithdrawalRequest.java">
+package com.ezeebit.wallet.web.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
+
+public record WithdrawalRequest(
+        @NotBlank String currency,
+        @Positive long amountMinor,
+        @NotBlank String destination,
+        @NotBlank String idempotencyKey
+) {}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/dto/WithdrawalResponse.java">
+package com.ezeebit.wallet.web.dto;
+
+import com.ezeebit.wallet.domain.Withdrawal;
+
+import java.time.Instant;
+
+public record WithdrawalResponse(
+        String withdrawalId,
+        String status,
+        String currency,
+        long amountMinor,
+        String destination,
+        String failureReason,
+        Instant updatedAt
+) {
+    public static WithdrawalResponse from(Withdrawal w) {
+        return new WithdrawalResponse(w.getPublicId(), w.getStatus().name(), w.getCurrencyCode(),
+                w.getAmountMinor(), w.getDestination(), w.getFailureReason(), w.getUpdatedAt());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/ApiError.java">
+package com.ezeebit.wallet.web;
+
+import java.time.Instant;
+
+public record ApiError(String error, String message, Instant timestamp) {
+    public static ApiError of(String error, String message) {
+        return new ApiError(error, message, Instant.now());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/BalanceController.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.domain.Account;
+import com.ezeebit.wallet.domain.LedgerEntry;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.service.AccountService;
+import com.ezeebit.wallet.web.dto.BalanceResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/merchants/{merchantId}")
+@RequiredArgsConstructor
+public class BalanceController {
+
+    private final AccountService accountService;
+
+    @GetMapping("/balances")
+    public List<BalanceResponse> balances(@PathVariable Long merchantId) {
+        return accountService.getBalances(merchantId).stream().map(BalanceResponse::from).toList();
+    }
+
+    /** The audit trail for a single currency's balance: every ledger entry that built it, in order. */
+    @GetMapping("/balances/{currency}/statement")
+    public List<LedgerEntry> statement(@PathVariable Long merchantId, @PathVariable String currency) {
+        Account account = accountService.getBalances(merchantId).stream()
+                .filter(a -> a.getCurrencyCode().equalsIgnoreCase(currency))
+                .findFirst()
+                .orElseThrow(() -> new NotFoundException("Merchant " + merchantId + " has no " + currency + " account"));
+        return accountService.getStatement(account.getId());
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/ConversionController.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.service.ConversionService;
+import com.ezeebit.wallet.web.dto.ConversionRequest;
+import com.ezeebit.wallet.web.dto.QuoteRequest;
+import com.ezeebit.wallet.web.dto.QuoteResponse;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/merchants/{merchantId}")
+@RequiredArgsConstructor
+public class ConversionController {
+
+    private final ConversionService conversionService;
+
+    @PostMapping("/quotes")
+    public ResponseEntity<QuoteResponse> quote(@PathVariable Long merchantId, @Valid @RequestBody QuoteRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(conversionService.createQuote(merchantId, request));
+    }
+
+    @PostMapping("/conversions")
+    public ResponseEntity<TransactionResponse> convert(@PathVariable Long merchantId, @Valid @RequestBody ConversionRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(conversionService.executeConversion(merchantId, request));
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/DepositController.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.service.DepositService;
+import com.ezeebit.wallet.web.dto.DepositRequest;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/merchants/{merchantId}/deposits")
+@RequiredArgsConstructor
+public class DepositController {
+
+    private final DepositService depositService;
+
+    @PostMapping
+    public ResponseEntity<TransactionResponse> deposit(@PathVariable Long merchantId,
+                                                         @Valid @RequestBody DepositRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(depositService.deposit(merchantId, request));
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/GlobalExceptionHandler.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.exception.*;
+import jakarta.validation.ConstraintViolationException;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(NotFoundException.class)
+    public ResponseEntity<ApiError> handleNotFound(NotFoundException e) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ApiError.of("NOT_FOUND", e.getMessage()));
+    }
+
+    @ExceptionHandler(InsufficientBalanceException.class)
+    public ResponseEntity<ApiError> handleInsufficientBalance(InsufficientBalanceException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiError.of("INSUFFICIENT_BALANCE", e.getMessage()));
+    }
+
+    @ExceptionHandler(CurrencyMismatchException.class)
+    public ResponseEntity<ApiError> handleCurrencyMismatch(CurrencyMismatchException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiError.of("CURRENCY_MISMATCH", e.getMessage()));
+    }
+
+    @ExceptionHandler(QuoteExpiredException.class)
+    public ResponseEntity<ApiError> handleQuoteExpired(QuoteExpiredException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiError.of("QUOTE_EXPIRED", e.getMessage()));
+    }
+
+    @ExceptionHandler(QuoteAlreadyUsedException.class)
+    public ResponseEntity<ApiError> handleQuoteUsed(QuoteAlreadyUsedException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiError.of("QUOTE_ALREADY_USED", e.getMessage()));
+    }
+
+    @ExceptionHandler(InvalidRequestException.class)
+    public ResponseEntity<ApiError> handleInvalidRequest(InvalidRequestException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiError.of("INVALID_REQUEST", e.getMessage()));
+    }
+
+    @ExceptionHandler(ExchangeRateUnavailableException.class)
+    public ResponseEntity<ApiError> handleRateUnavailable(ExchangeRateUnavailableException e) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ApiError.of("RATE_UNAVAILABLE", e.getMessage()));
+    }
+
+    @ExceptionHandler({MethodArgumentNotValidException.class, ConstraintViolationException.class, IllegalArgumentException.class})
+    public ResponseEntity<ApiError> handleValidation(Exception e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiError.of("VALIDATION_ERROR", e.getMessage()));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiError> handleUnexpected(Exception e) {
+        log.error("Unhandled exception", e);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiError.of("INTERNAL_ERROR", "Something went wrong"));
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/PayoutWebhookController.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.service.WithdrawalService;
+import com.ezeebit.wallet.web.dto.PayoutCallbackRequest;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+/**
+ * Where a real payout rail's webhook would land. In this exercise,
+ * MockPayoutRailClient calls WithdrawalService directly to simulate the
+ * same event, but this endpoint exists so the flow can be triggered by hand
+ * (or by a test) exactly the way production would receive it - and so the
+ * idempotency behaviour (a redelivered notification is a no-op) is directly
+ * observable over HTTP.
+ */
+@RestController
+@RequestMapping("/webhooks/payouts/{withdrawalId}")
+@RequiredArgsConstructor
+public class PayoutWebhookController {
+
+    private final WithdrawalService withdrawalService;
+
+    @PostMapping
+    public ResponseEntity<Void> handleCallback(@PathVariable String withdrawalId,
+                                                @Valid @RequestBody PayoutCallbackRequest request) {
+        withdrawalService.handlePayoutResult(withdrawalId, request.success(), request.externalRef(), request.failureReason());
+        return ResponseEntity.noContent().build();
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/web/WithdrawalController.java">
+package com.ezeebit.wallet.web;
+
+import com.ezeebit.wallet.service.WithdrawalService;
+import com.ezeebit.wallet.web.dto.WithdrawalRequest;
+import com.ezeebit.wallet.web.dto.WithdrawalResponse;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/merchants/{merchantId}/withdrawals")
+@RequiredArgsConstructor
+public class WithdrawalController {
+
+    private final WithdrawalService withdrawalService;
+
+    @PostMapping
+    public ResponseEntity<WithdrawalResponse> withdraw(@PathVariable Long merchantId,
+                                                         @Valid @RequestBody WithdrawalRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(withdrawalService.initiateWithdrawal(merchantId, request));
+    }
+}
+</file>
+
+<file path="src/main/java/com/ezeebit/wallet/WalletApplication.java">
+package com.ezeebit.wallet;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class WalletApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(WalletApplication.class, args);
+    }
+}
+</file>
+
+<file path="src/main/resources/db/migration/V1__init_schema.sql">
+-- Ezeebit wallet core schema.
+-- Money is always stored as integer "minor units" (cents / smallest stablecoin unit)
+-- to avoid floating point errors. `currency_definitions.decimals` says how to render it.
+
+CREATE TABLE merchants (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(255)      NOT NULL,
+    is_system   BOOLEAN           NOT NULL DEFAULT FALSE,
+    created_at  DATETIME(6)       NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB;
+
+CREATE TABLE currency_definitions (
+    code            VARCHAR(10)  PRIMARY KEY,
+    currency_type   VARCHAR(10)  NOT NULL,   -- FIAT | CRYPTO
+    decimals        INT          NOT NULL,
+    CONSTRAINT chk_currency_type CHECK (currency_type IN ('FIAT', 'CRYPTO'))
+) ENGINE=InnoDB;
+
+-- One row per (merchant, currency). Never mix currencies in a single account.
+CREATE TABLE accounts (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merchant_id     BIGINT       NOT NULL,
+    currency_code   VARCHAR(10)  NOT NULL,
+    balance_minor   BIGINT       NOT NULL DEFAULT 0,
+    version         BIGINT       NOT NULL DEFAULT 0,
+    created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_accounts_merchant FOREIGN KEY (merchant_id) REFERENCES merchants(id),
+    CONSTRAINT fk_accounts_currency FOREIGN KEY (currency_code) REFERENCES currency_definitions(code),
+    CONSTRAINT uq_account_merchant_currency UNIQUE (merchant_id, currency_code),
+    -- Real merchant balances can never go negative. The one exception is the
+    -- SYSTEM merchant's (id 0) per-currency clearing accounts, which are the
+    -- counterparty leg of every conversion (see ConversionService) and are
+    -- allowed to run negative between the two legs of a conversion - that
+    -- negative number *is* the platform's short-term FX exposure, which in
+    -- production is hedged/settled the way the brief describes.
+    CONSTRAINT chk_balance_non_negative CHECK (merchant_id = 0 OR balance_minor >= 0)
+) ENGINE=InnoDB;
+
+-- One row per business operation (deposit / conversion / withdrawal / reversal).
+-- The idempotency guard lives here: (merchant_id, idempotency_key) is unique,
+-- so a retried request from a flaky mobile connection can never be applied twice.
+CREATE TABLE transactions (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    public_id           VARCHAR(36)  NOT NULL,
+    merchant_id         BIGINT       NOT NULL,
+    type                VARCHAR(30)  NOT NULL,   -- DEPOSIT | CONVERSION | WITHDRAWAL | WITHDRAWAL_REVERSAL
+    status              VARCHAR(20)  NOT NULL,   -- PENDING | COMPLETED | FAILED
+    idempotency_key     VARCHAR(100) NOT NULL,
+    metadata_json       TEXT NULL,
+    created_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_tx_merchant FOREIGN KEY (merchant_id) REFERENCES merchants(id),
+    CONSTRAINT uq_tx_public_id UNIQUE (public_id),
+    CONSTRAINT uq_tx_merchant_idempotency UNIQUE (merchant_id, idempotency_key)
+) ENGINE=InnoDB;
+
+-- Immutable, append-only double-entry ledger. Every transaction produces a
+-- balanced set of debit/credit rows. Nothing here is ever updated or deleted;
+-- it is the audit trail for "how did this balance reach its current value".
+CREATE TABLE ledger_entries (
+    id                   BIGINT AUTO_INCREMENT PRIMARY KEY,
+    account_id           BIGINT       NOT NULL,
+    transaction_id       BIGINT       NOT NULL,
+    entry_type           VARCHAR(10)  NOT NULL,  -- DEBIT | CREDIT
+    amount_minor         BIGINT       NOT NULL,
+    balance_after_minor  BIGINT       NOT NULL,
+    created_at           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_ledger_account FOREIGN KEY (account_id) REFERENCES accounts(id),
+    CONSTRAINT fk_ledger_tx FOREIGN KEY (transaction_id) REFERENCES transactions(id),
+    CONSTRAINT chk_amount_positive CHECK (amount_minor > 0)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_ledger_account ON ledger_entries(account_id, id);
+CREATE INDEX idx_ledger_tx ON ledger_entries(transaction_id);
+
+-- A short-lived, locked-in price for a conversion. The merchant executes
+-- against the quote id, not against "the market rate", so the platform
+-- never re-prices a conversion mid-flight.
+CREATE TABLE conversion_quotes (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    public_id           VARCHAR(36)  NOT NULL,
+    merchant_id         BIGINT       NOT NULL,
+    from_currency       VARCHAR(10)  NOT NULL,
+    to_currency         VARCHAR(10)  NOT NULL,
+    from_amount_minor   BIGINT       NOT NULL,
+    to_amount_minor     BIGINT       NOT NULL,
+    rate                DECIMAL(24,10) NOT NULL,
+    status              VARCHAR(20)  NOT NULL,  -- ACTIVE | USED | EXPIRED
+    expires_at          DATETIME(6)  NOT NULL,
+    created_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_quote_merchant FOREIGN KEY (merchant_id) REFERENCES merchants(id),
+    CONSTRAINT uq_quote_public_id UNIQUE (public_id)
+) ENGINE=InnoDB;
+
+-- One row per payout request. The payout rail is async, so this row tracks
+-- the whole lifecycle: PENDING (funds reserved, rail not yet confirmed),
+-- PROCESSING (rail accepted it), COMPLETED, FAILED (funds released back).
+CREATE TABLE withdrawals (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    public_id           VARCHAR(36)  NOT NULL,
+    merchant_id         BIGINT       NOT NULL,
+    account_id          BIGINT       NOT NULL,
+    transaction_id      BIGINT       NOT NULL,
+    amount_minor        BIGINT       NOT NULL,
+    currency_code       VARCHAR(10)  NOT NULL,
+    destination         VARCHAR(255) NOT NULL,
+    status              VARCHAR(20)  NOT NULL,  -- PENDING | PROCESSING | COMPLETED | FAILED
+    idempotency_key     VARCHAR(100) NOT NULL,
+    external_ref        VARCHAR(100) NULL,
+    failure_reason      VARCHAR(500) NULL,
+    created_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_wd_merchant FOREIGN KEY (merchant_id) REFERENCES merchants(id),
+    CONSTRAINT fk_wd_account FOREIGN KEY (account_id) REFERENCES accounts(id),
+    CONSTRAINT fk_wd_tx FOREIGN KEY (transaction_id) REFERENCES transactions(id),
+    CONSTRAINT uq_wd_public_id UNIQUE (public_id),
+    CONSTRAINT uq_wd_merchant_idempotency UNIQUE (merchant_id, idempotency_key)
+) ENGINE=InnoDB;
+</file>
+
+<file path="src/main/resources/db/migration/V2__seed_reference_data.sql">
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_AUTO_VALUE_ON_ZERO');
+
+-- Reference currencies used in the take-home scenario.
+INSERT INTO currency_definitions (code, currency_type, decimals) VALUES
+                                                                     ('ZAR', 'FIAT', 2),
+                                                                     ('NGN', 'FIAT', 2),
+                                                                     ('KES', 'FIAT', 2),
+                                                                     ('USDT', 'CRYPTO', 6),
+                                                                     ('USDC', 'CRYPTO', 6);
+
+-- The SYSTEM merchant (id 0) is not a real customer.
+INSERT INTO merchants (id, name, is_system) VALUES (0, 'EZEEBIT_SYSTEM', TRUE);
+
+INSERT INTO accounts (merchant_id, currency_code, balance_minor)
+SELECT 0, code, 0 FROM currency_definitions;
+
+-- A couple of demo merchants
+INSERT INTO merchants (id, name, is_system) VALUES
+                                                (1, 'iStore Cape Town', FALSE),
+                                                (2, 'Sunbet Online', FALSE);
+</file>
+
+<file path="src/main/resources/application.yml">
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ezeebit-wallet
+  datasource:
+    url: jdbc:mysql://localhost:3306/ezeebit_wallet?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ezeebit
+    password: ezeebit
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+# How long a conversion quote stays valid for before the merchant must re-quote.
+ezeebit:
+  conversion:
+    quote-ttl-seconds: 20
+  system:
+    merchant-id: 0
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/AccountServiceTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.Account;
+import com.ezeebit.wallet.domain.LedgerEntry;
+import com.ezeebit.wallet.domain.Merchant;
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.exception.InsufficientBalanceException;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.AccountRepository;
+import com.ezeebit.wallet.repository.LedgerEntryRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AccountServiceTest {
+
+    @Mock AccountRepository accountRepository;
+    @Mock LedgerEntryRepository ledgerEntryRepository;
+    @Mock AccountProvisioner accountProvisioner;
+
+    AccountService accountService;
+    MoneyTransaction tx;
+
+    @BeforeEach
+    void setUp() {
+        accountService = new AccountService(accountRepository, ledgerEntryRepository, accountProvisioner);
+        tx = MoneyTransaction.builder().id(99L).build();
+    }
+
+    @Test
+    void credit_increasesBalanceAndWritesLedgerEntry() {
+        Account account = accountOf(1L, 5L, "ZAR", 1_000L);
+
+        accountService.credit(account, 500L, tx);
+
+        assertThat(account.getBalanceMinor()).isEqualTo(1_500L);
+        ArgumentCaptor<LedgerEntry> captor = ArgumentCaptor.forClass(LedgerEntry.class);
+        verify(ledgerEntryRepository).save(captor.capture());
+        LedgerEntry entry = captor.getValue();
+        assertThat(entry.getEntryType()).isEqualTo(LedgerEntry.EntryType.CREDIT);
+        assertThat(entry.getAmountMinor()).isEqualTo(500L);
+        assertThat(entry.getBalanceAfterMinor()).isEqualTo(1_500L);
+        assertThat(entry.getAccountId()).isEqualTo(5L);
+        assertThat(entry.getTransactionId()).isEqualTo(99L);
+    }
+
+    @Test
+    void debit_withSufficientBalance_decreasesBalanceAndWritesLedgerEntry() {
+        Account account = accountOf(1L, 5L, "ZAR", 1_000L);
+
+        accountService.debit(account, 400L, tx);
+
+        assertThat(account.getBalanceMinor()).isEqualTo(600L);
+        verify(ledgerEntryRepository).save(argThat(e -> e.getEntryType() == LedgerEntry.EntryType.DEBIT
+                && e.getAmountMinor() == 400L && e.getBalanceAfterMinor() == 600L));
+    }
+
+    @Test
+    void debit_withInsufficientBalance_throwsAndLeavesBalanceUntouched() {
+        Account account = accountOf(1L, 5L, "ZAR", 100L);
+
+        assertThatThrownBy(() -> accountService.debit(account, 500L, tx))
+                .isInstanceOf(InsufficientBalanceException.class);
+
+        assertThat(account.getBalanceMinor()).isEqualTo(100L);
+        verifyNoInteractions(ledgerEntryRepository);
+    }
+
+    @Test
+    void debit_onSystemFloatAccount_isAllowedToGoNegative() {
+        Account systemAccount = accountOf(Merchant.SYSTEM_MERCHANT_ID, 9L, "USDT", 0L);
+
+        accountService.debit(systemAccount, 250L, tx);
+
+        assertThat(systemAccount.getBalanceMinor()).isEqualTo(-250L);
+    }
+
+    @Test
+    void debit_rejectsNonPositiveAmounts() {
+        Account account = accountOf(1L, 5L, "ZAR", 1_000L);
+        assertThatThrownBy(() -> accountService.debit(account, 0L, tx)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> accountService.debit(account, -10L, tx)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void lockOrCreateAccount_whenAccountExists_returnsItWithoutProvisioning() {
+        Account existing = accountOf(1L, 5L, "ZAR", 0L);
+        when(accountRepository.findByMerchantIdAndCurrencyCode(1L, "ZAR")).thenReturn(Optional.of(existing));
+        when(accountRepository.findForUpdate(1L, "ZAR")).thenReturn(Optional.of(existing));
+
+        Account result = accountService.lockOrCreateAccount(1L, "ZAR");
+
+        assertThat(result).isSameAs(existing);
+        verifyNoInteractions(accountProvisioner);
+    }
+
+    @Test
+    void lockOrCreateAccount_whenMissing_provisionsThenRelocksAndReturnsIt() {
+        Account created = accountOf(1L, 5L, "ZAR", 0L);
+        when(accountRepository.findByMerchantIdAndCurrencyCode(1L, "ZAR")).thenReturn(Optional.empty());
+        when(accountRepository.findForUpdate(1L, "ZAR")).thenReturn(Optional.of(created));
+
+        Account result = accountService.lockOrCreateAccount(1L, "ZAR");
+
+        assertThat(result).isSameAs(created);
+        verify(accountProvisioner).ensureAccountExists(1L, "ZAR");
+    }
+
+    @Test
+    void lockExistingAccount_whenMissing_throwsNotFound() {
+        when(accountRepository.findForUpdate(1L, "ZAR")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> accountService.lockExistingAccount(1L, "ZAR"))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    private Account accountOf(long merchantId, long accountId, String currency, long balance) {
+        Account a = Account.builder().merchantId(merchantId).currencyCode(currency).balanceMinor(balance).build();
+        a.setId(accountId);
+        return a;
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/ConversionExecutorTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.*;
+import com.ezeebit.wallet.exception.InsufficientBalanceException;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.exception.QuoteAlreadyUsedException;
+import com.ezeebit.wallet.exception.QuoteExpiredException;
+import com.ezeebit.wallet.repository.ConversionQuoteRepository;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class ConversionExecutorTest {
+
+    @Mock AccountService accountService;
+    @Mock TransactionRepository transactionRepository;
+    @Mock ConversionQuoteRepository quoteRepository;
+
+    ConversionExecutor executor;
+    MoneyTransaction managedTx;
+
+    static final Long MERCHANT_ID = 1L;
+
+    @BeforeEach
+    void setUp() {
+        executor = new ConversionExecutor(accountService, transactionRepository, quoteRepository);
+        managedTx = MoneyTransaction.builder().id(10L).status(TransactionStatus.PENDING).build();
+        when(transactionRepository.getReferenceById(10L)).thenReturn(managedTx);
+    }
+
+    @Test
+    void execute_happyPath_movesBothLegsAndMarksQuoteUsedAndTxCompleted() {
+        ConversionQuote quote = activeQuote("USDT", "ZAR", 100L, 1850L);
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+
+        Account merchantUsdt = account(MERCHANT_ID, 1L, "USDT", 1000L);
+        Account merchantZar = account(MERCHANT_ID, 2L, "ZAR", 0L);
+        Account systemUsdt = account(Merchant.SYSTEM_MERCHANT_ID, 3L, "USDT", 0L);
+        Account systemZar = account(Merchant.SYSTEM_MERCHANT_ID, 4L, "ZAR", 50000L);
+        when(accountService.lockOrCreateAccount(MERCHANT_ID, "USDT")).thenReturn(merchantUsdt);
+        when(accountService.lockOrCreateAccount(MERCHANT_ID, "ZAR")).thenReturn(merchantZar);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "USDT")).thenReturn(systemUsdt);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR")).thenReturn(systemZar);
+
+        MoneyTransaction inputTx = MoneyTransaction.builder().id(10L).build();
+        executor.execute(inputTx, MERCHANT_ID, "q1");
+
+        verify(accountService).debit(merchantUsdt, 100L, managedTx);
+        verify(accountService).credit(systemUsdt, 100L, managedTx);
+        verify(accountService).debit(systemZar, 1850L, managedTx);
+        verify(accountService).credit(merchantZar, 1850L, managedTx);
+        assertThat(quote.getStatus()).isEqualTo(ConversionQuote.QuoteStatus.USED);
+        assertThat(managedTx.getStatus()).isEqualTo(TransactionStatus.COMPLETED);
+    }
+
+    @Test
+    void execute_locksAccountsInAlphabeticalCurrencyOrder_toAvoidDeadlocks() {
+        ConversionQuote quote = activeQuote("USDT", "ZAR", 100L, 1850L);
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+        stubAllAccounts();
+
+        executor.execute(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, "q1");
+
+        InOrder inOrder = inOrder(accountService);
+        inOrder.verify(accountService).lockOrCreateAccount(MERCHANT_ID, "USDT");   // alphabetically first ('U' < 'Z')
+        inOrder.verify(accountService).lockOrCreateAccount(MERCHANT_ID, "ZAR");
+        inOrder.verify(accountService).lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "USDT");
+        inOrder.verify(accountService).lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR");
+    }
+
+    @Test
+    void execute_expiredQuote_throwsAndNeverTouchesAnyAccount() {
+        ConversionQuote quote = ConversionQuote.builder()
+                .publicId("q1").merchantId(MERCHANT_ID).fromCurrency("USDT").toCurrency("ZAR")
+                .fromAmountMinor(100L).toAmountMinor(1850L).rate(BigDecimal.TEN)
+                .status(ConversionQuote.QuoteStatus.ACTIVE).expiresAt(Instant.now().minusSeconds(5))
+                .build();
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+
+        assertThatThrownBy(() -> executor.execute(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, "q1"))
+                .isInstanceOf(QuoteExpiredException.class);
+
+        verifyNoInteractions(accountService);
+    }
+
+    @Test
+    void execute_alreadyUsedQuote_throwsAndNeverTouchesAnyAccount() {
+        ConversionQuote quote = activeQuote("USDT", "ZAR", 100L, 1850L);
+        quote.setStatus(ConversionQuote.QuoteStatus.USED);
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+
+        assertThatThrownBy(() -> executor.execute(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, "q1"))
+                .isInstanceOf(QuoteAlreadyUsedException.class);
+
+        verifyNoInteractions(accountService);
+    }
+
+    @Test
+    void execute_quoteBelongsToAnotherMerchant_throwsNotFound_ratherThanLeakingItsExistence() {
+        ConversionQuote quote = activeQuote("USDT", "ZAR", 100L, 1850L);
+        quote.setMerchantId(999L);
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+
+        assertThatThrownBy(() -> executor.execute(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, "q1"))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(accountService);
+    }
+
+    @Test
+    void execute_merchantLacksFunds_debitThrows_soTheCreditLegNeverHappens() {
+        ConversionQuote quote = activeQuote("USDT", "ZAR", 100L, 1850L);
+        when(quoteRepository.findByPublicIdForUpdate("q1")).thenReturn(Optional.of(quote));
+
+        Account merchantUsdt = account(MERCHANT_ID, 1L, "USDT", 10L); // not enough
+        Account merchantZar = account(MERCHANT_ID, 2L, "ZAR", 0L);
+        Account systemUsdt = account(Merchant.SYSTEM_MERCHANT_ID, 3L, "USDT", 0L);
+        Account systemZar = account(Merchant.SYSTEM_MERCHANT_ID, 4L, "ZAR", 50000L);
+        when(accountService.lockOrCreateAccount(MERCHANT_ID, "ZAR")).thenReturn(merchantZar);
+        when(accountService.lockOrCreateAccount(MERCHANT_ID, "USDT")).thenReturn(merchantUsdt);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR")).thenReturn(systemZar);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "USDT")).thenReturn(systemUsdt);
+        doThrow(new InsufficientBalanceException("not enough"))
+                .when(accountService).debit(merchantUsdt, 100L, managedTx);
+
+        assertThatThrownBy(() -> executor.execute(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, "q1"))
+                .isInstanceOf(InsufficientBalanceException.class);
+
+        // The platform never credits itself the merchant's funds unless the debit actually succeeded.
+        verify(accountService, never()).credit(eq(systemUsdt), any(Long.class), any());
+        verify(accountService, never()).debit(eq(systemZar), any(Long.class), any());
+        verify(accountService, never()).credit(eq(merchantZar), any(Long.class), any());
+        assertThat(quote.getStatus()).isEqualTo(ConversionQuote.QuoteStatus.ACTIVE);
+    }
+
+    private void stubAllAccounts() {
+        when(accountService.lockOrCreateAccount(eq(MERCHANT_ID), any())).thenAnswer(inv ->
+                account(MERCHANT_ID, 1L, inv.getArgument(1), 100_000L));
+        when(accountService.lockOrCreateAccount(eq(Merchant.SYSTEM_MERCHANT_ID), any())).thenAnswer(inv ->
+                account(Merchant.SYSTEM_MERCHANT_ID, 2L, inv.getArgument(1), 100_000L));
+    }
+
+    private ConversionQuote activeQuote(String from, String to, long fromAmount, long toAmount) {
+        return ConversionQuote.builder()
+                .publicId("q1").merchantId(MERCHANT_ID).fromCurrency(from).toCurrency(to)
+                .fromAmountMinor(fromAmount).toAmountMinor(toAmount).rate(BigDecimal.TEN)
+                .status(ConversionQuote.QuoteStatus.ACTIVE).expiresAt(Instant.now().plusSeconds(30))
+                .build();
+    }
+
+    private Account account(long merchantId, long id, String currency, long balance) {
+        Account a = Account.builder().merchantId(merchantId).currencyCode(currency).balanceMinor(balance).build();
+        a.setId(id);
+        return a;
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/ConversionServiceTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.*;
+import com.ezeebit.wallet.exception.ExchangeRateUnavailableException;
+import com.ezeebit.wallet.exception.InvalidRequestException;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.ConversionQuoteRepository;
+import com.ezeebit.wallet.repository.CurrencyDefinitionRepository;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.service.exchangerate.ExchangeRateClient;
+import com.ezeebit.wallet.web.dto.ConversionRequest;
+import com.ezeebit.wallet.web.dto.QuoteRequest;
+import com.ezeebit.wallet.web.dto.QuoteResponse;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.math.BigDecimal;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class ConversionServiceTest {
+
+    @Mock TransactionService transactionService;
+    @Mock TransactionRepository transactionRepository;
+    @Mock ConversionQuoteRepository quoteRepository;
+    @Mock CurrencyDefinitionRepository currencyDefinitionRepository;
+    @Mock ExchangeRateClient exchangeRateClient;
+    @Mock ConversionExecutor conversionExecutor;
+
+    ConversionService conversionService;
+
+    @BeforeEach
+    void setUp() {
+        conversionService = new ConversionService(transactionService, transactionRepository, quoteRepository,
+                currencyDefinitionRepository, exchangeRateClient, conversionExecutor);
+        ReflectionTestUtils.setField(conversionService, "quoteTtlSeconds", 20L);
+    }
+
+    @Test
+    void createQuote_happyPath_convertsUsingCurrencyDecimalsAndRate() {
+        // 100.00 USDT (decimals=6, so 100_000000 minor units) at rate 18.50 -> 1850.00 ZAR (decimals=2)
+        when(currencyDefinitionRepository.findById("USDT"))
+                .thenReturn(Optional.of(currency("USDT", 6)));
+        when(currencyDefinitionRepository.findById("ZAR"))
+                .thenReturn(Optional.of(currency("ZAR", 2)));
+        when(exchangeRateClient.getRate("USDT", "ZAR")).thenReturn(new BigDecimal("18.50"));
+
+        QuoteResponse quote = conversionService.createQuote(1L,
+                new QuoteRequest("USDT", "ZAR", 100_000_000L));
+
+        assertThat(quote.toAmountMinor()).isEqualTo(185_000L); // 1850.00 ZAR in cents
+        assertThat(quote.rate()).isEqualByComparingTo("18.50");
+    }
+
+    @Test
+    void createQuote_roundsDownInThePlatformsFavour() {
+        // 1 minor unit of USDT (0.000001) at a rate that produces a fractional
+        // ZAR cent must round DOWN, never up - the platform never pays out
+        // more than the rate actually justifies.
+        when(currencyDefinitionRepository.findById("USDT")).thenReturn(Optional.of(currency("USDT", 6)));
+        when(currencyDefinitionRepository.findById("ZAR")).thenReturn(Optional.of(currency("ZAR", 2)));
+        when(exchangeRateClient.getRate("USDT", "ZAR")).thenReturn(new BigDecimal("18.999"));
+
+        QuoteResponse quote = conversionService.createQuote(1L, new QuoteRequest("USDT", "ZAR", 1000L)); // 0.001 USDT
+
+        // 0.001 * 18.999 = 0.018999 ZAR -> floors to 0.01 ZAR = 1 minor unit
+        assertThat(quote.toAmountMinor()).isEqualTo(1L);
+    }
+
+    @Test
+    void createQuote_sameCurrencyBothSides_rejected() {
+        assertThatThrownBy(() -> conversionService.createQuote(1L, new QuoteRequest("ZAR", "ZAR", 100L)))
+                .isInstanceOf(InvalidRequestException.class);
+        verifyNoInteractions(exchangeRateClient);
+    }
+
+    @Test
+    void createQuote_unknownCurrency_throwsNotFound() {
+        when(currencyDefinitionRepository.findById("XYZ")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> conversionService.createQuote(1L, new QuoteRequest("XYZ", "ZAR", 100L)))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    @Test
+    void createQuote_whenRateFeedFails_propagatesExchangeRateUnavailable() {
+        when(currencyDefinitionRepository.findById("USDT")).thenReturn(Optional.of(currency("USDT", 6)));
+        when(currencyDefinitionRepository.findById("ZAR")).thenReturn(Optional.of(currency("ZAR", 2)));
+        when(exchangeRateClient.getRate("USDT", "ZAR"))
+                .thenThrow(new ExchangeRateUnavailableException("timeout"));
+
+        assertThatThrownBy(() -> conversionService.createQuote(1L, new QuoteRequest("USDT", "ZAR", 100L)))
+                .isInstanceOf(ExchangeRateUnavailableException.class);
+        verify(quoteRepository, never()).save(any());
+    }
+
+    @Test
+    void executeConversion_replayedIdempotencyKey_neverCallsExecutorTwice() {
+        MoneyTransaction alreadyCompleted = MoneyTransaction.builder()
+                .id(5L).merchantId(1L).type(TransactionType.CONVERSION).status(TransactionStatus.COMPLETED)
+                .idempotencyKey("k1").build();
+        when(transactionService.claim(eq(1L), eq(TransactionType.CONVERSION), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(alreadyCompleted, false));
+
+        TransactionResponse response = conversionService.executeConversion(1L, new ConversionRequest("quote-1", "k1"));
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+        verifyNoInteractions(conversionExecutor);
+    }
+
+    private CurrencyDefinition currency(String code, int decimals) {
+        return CurrencyDefinition.builder().code(code).decimals(decimals)
+                .currencyType(CurrencyDefinition.CurrencyType.CRYPTO).build();
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/DepositServiceTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.domain.TransactionStatus;
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.exception.InsufficientBalanceException;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.web.dto.DepositRequest;
+import com.ezeebit.wallet.web.dto.TransactionResponse;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class DepositServiceTest {
+
+    @Mock TransactionService transactionService;
+    @Mock TransactionRepository transactionRepository;
+    @Mock DepositExecutor depositExecutor;
+
+    DepositService depositService;
+
+    @BeforeEach
+    void setUp() {
+        depositService = new DepositService(transactionService, transactionRepository, depositExecutor);
+    }
+
+    @Test
+    void deposit_happyPath_executesOnceAndReturnsCompletedTransaction() {
+        MoneyTransaction pending = MoneyTransaction.builder()
+                .id(1L).merchantId(7L).type(TransactionType.DEPOSIT).status(TransactionStatus.PENDING)
+                .idempotencyKey("k1").build();
+        MoneyTransaction completed = MoneyTransaction.builder()
+                .id(1L).merchantId(7L).type(TransactionType.DEPOSIT).status(TransactionStatus.COMPLETED)
+                .idempotencyKey("k1").build();
+        when(transactionService.claim(eq(7L), eq(TransactionType.DEPOSIT), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(pending, true));
+        when(transactionRepository.findById(1L)).thenReturn(Optional.of(completed));
+
+        TransactionResponse response = depositService.deposit(7L,
+                new DepositRequest("ZAR", 1000L, "k1", null));
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+        verify(depositExecutor).execute(eq(pending), eq(7L), any(DepositRequest.class));
+    }
+
+    @Test
+    void deposit_replayedIdempotencyKey_neverCallsExecutorAgain() {
+        // Simulates the dashboard firing the same deposit twice over a flaky connection.
+        MoneyTransaction alreadyCompleted = MoneyTransaction.builder()
+                .id(1L).merchantId(7L).type(TransactionType.DEPOSIT).status(TransactionStatus.COMPLETED)
+                .idempotencyKey("k1").build();
+        when(transactionService.claim(eq(7L), eq(TransactionType.DEPOSIT), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(alreadyCompleted, false));
+
+        TransactionResponse response = depositService.deposit(7L,
+                new DepositRequest("ZAR", 1000L, "k1", null));
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+        verifyNoInteractions(depositExecutor);
+        verifyNoInteractions(transactionRepository);
+    }
+
+    @Test
+    void deposit_whenExecutionFails_marksTransactionFailedAndRethrows() {
+        MoneyTransaction pending = MoneyTransaction.builder()
+                .id(1L).merchantId(7L).type(TransactionType.DEPOSIT).status(TransactionStatus.PENDING)
+                .idempotencyKey("k1").build();
+        when(transactionService.claim(eq(7L), eq(TransactionType.DEPOSIT), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(pending, true));
+        doThrow(new InsufficientBalanceException("boom"))
+                .when(depositExecutor).execute(any(), any(), any());
+
+        assertThatThrownBy(() -> depositService.deposit(7L, new DepositRequest("ZAR", 1000L, "k1", null)))
+                .isInstanceOf(InsufficientBalanceException.class);
+
+        verify(transactionService).markFailed(1L, "boom");
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/TransactionServiceTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.domain.TransactionStatus;
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class TransactionServiceTest {
+
+    @Mock TransactionRepository transactionRepository;
+    TransactionService transactionService;
+
+    @BeforeEach
+    void setUp() {
+        transactionService = new TransactionService(transactionRepository);
+    }
+
+    @Test
+    void claim_withFreshKey_insertsAndReturnsNewClaim() {
+        when(transactionRepository.saveAndFlush(any(MoneyTransaction.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        TransactionService.ClaimResult result = transactionService.claim(
+                1L, TransactionType.DEPOSIT, "idem-1", "{}");
+
+        assertThat(result.isNew()).isTrue();
+        assertThat(result.transaction().getStatus()).isEqualTo(TransactionStatus.PENDING);
+        assertThat(result.transaction().getIdempotencyKey()).isEqualTo("idem-1");
+        verify(transactionRepository).saveAndFlush(any(MoneyTransaction.class));
+    }
+
+    @Test
+    void claim_replayedKey_doesNotInsertTwice_returnsOriginalTransaction() {
+        MoneyTransaction original = MoneyTransaction.builder()
+                .id(42L).merchantId(1L).type(TransactionType.DEPOSIT)
+                .status(TransactionStatus.COMPLETED).idempotencyKey("idem-1").build();
+        when(transactionRepository.findByMerchantIdAndIdempotencyKey(1L, "idem-1"))
+                .thenReturn(Optional.of(original));
+
+        TransactionService.ClaimResult result = transactionService.claim(1L, TransactionType.DEPOSIT, "idem-1", "{}");
+
+        assertThat(result.isNew()).isFalse();
+        assertThat(result.transaction()).isSameAs(original);
+    }
+
+    @Test
+    void markCompleted_setsStatusToCompleted() {
+        MoneyTransaction tx = MoneyTransaction.builder().id(1L).status(TransactionStatus.PENDING).build();
+        when(transactionRepository.getReferenceById(1L)).thenReturn(tx);
+
+        transactionService.markCompleted(1L);
+
+        assertThat(tx.getStatus()).isEqualTo(TransactionStatus.COMPLETED);
+    }
+
+    @Test
+    void markFailed_setsStatusToFailedAndRecordsReason() {
+        MoneyTransaction tx = MoneyTransaction.builder().id(1L).status(TransactionStatus.PENDING).build();
+        when(transactionRepository.getReferenceById(1L)).thenReturn(tx);
+
+        transactionService.markFailed(1L, "insufficient balance");
+
+        assertThat(tx.getStatus()).isEqualTo(TransactionStatus.FAILED);
+        assertThat(tx.getMetadataJson()).contains("insufficient balance");
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/WithdrawalExecutorTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.*;
+import com.ezeebit.wallet.exception.NotFoundException;
+import com.ezeebit.wallet.repository.TransactionRepository;
+import com.ezeebit.wallet.repository.WithdrawalRepository;
+import com.ezeebit.wallet.web.dto.WithdrawalRequest;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class WithdrawalExecutorTest {
+
+    @Mock AccountService accountService;
+    @Mock TransactionRepository transactionRepository;
+    @Mock WithdrawalRepository withdrawalRepository;
+
+    WithdrawalExecutor executor;
+    static final Long MERCHANT_ID = 1L;
+
+    @BeforeEach
+    void setUp() {
+        executor = new WithdrawalExecutor(accountService, transactionRepository, withdrawalRepository);
+    }
+
+    @Test
+    void reserveFunds_debitsMerchantAndCreditsSystemSuspense_thenRecordsPendingWithdrawal() {
+        MoneyTransaction managedTx = MoneyTransaction.builder().id(10L).build();
+        when(transactionRepository.getReferenceById(10L)).thenReturn(managedTx);
+        Account merchantAccount = account(MERCHANT_ID, 1L, "ZAR", 5000L);
+        Account systemAccount = account(Merchant.SYSTEM_MERCHANT_ID, 2L, "ZAR", 0L);
+        when(accountService.lockExistingAccount(MERCHANT_ID, "ZAR")).thenReturn(merchantAccount);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR")).thenReturn(systemAccount);
+
+        WithdrawalRequest request = new WithdrawalRequest("ZAR", 2000L, "acc-123", "idem-1");
+        Withdrawal withdrawal = executor.reserveFunds(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID, request);
+
+        verify(accountService).debit(merchantAccount, 2000L, managedTx);
+        verify(accountService).credit(systemAccount, 2000L, managedTx);
+        assertThat(withdrawal.getStatus()).isEqualTo(Withdrawal.WithdrawalStatus.PENDING);
+        assertThat(withdrawal.getAmountMinor()).isEqualTo(2000L);
+        assertThat(withdrawal.getDestination()).isEqualTo("acc-123");
+        verify(withdrawalRepository).save(withdrawal);
+        // The MoneyTransaction stays PENDING here - it only resolves once the async rail calls back.
+        assertThat(managedTx.getStatus()).isNotEqualTo(TransactionStatus.COMPLETED);
+    }
+
+    @Test
+    void reserveFunds_whenMerchantHasNoAccountForCurrency_throwsNotFound_beforeCreatingWithdrawal() {
+        when(transactionRepository.getReferenceById(10L)).thenReturn(MoneyTransaction.builder().id(10L).build());
+        when(accountService.lockExistingAccount(MERCHANT_ID, "ZAR"))
+                .thenThrow(new NotFoundException("no account"));
+
+        assertThatThrownBy(() -> executor.reserveFunds(MoneyTransaction.builder().id(10L).build(), MERCHANT_ID,
+                new WithdrawalRequest("ZAR", 2000L, "acc-123", "idem-1")))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(withdrawalRepository);
+    }
+
+    @Test
+    void applyPayoutResult_onSuccess_clearsSuspenseAndCompletesWithdrawalAndTransaction() {
+        Withdrawal withdrawal = pendingWithdrawal();
+        MoneyTransaction originalTx = MoneyTransaction.builder().id(withdrawal.getTransactionId()).status(TransactionStatus.PENDING).build();
+        when(withdrawalRepository.findByPublicIdForUpdate("wd-1")).thenReturn(Optional.of(withdrawal));
+        when(transactionRepository.getReferenceById(withdrawal.getTransactionId())).thenReturn(originalTx);
+        Account systemAccount = account(Merchant.SYSTEM_MERCHANT_ID, 2L, "ZAR", 2000L);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR")).thenReturn(systemAccount);
+
+        executor.applyPayoutResult("wd-1", true, "rail-ref-1", null);
+
+        verify(accountService).debit(systemAccount, 2000L, originalTx);
+        assertThat(withdrawal.getStatus()).isEqualTo(Withdrawal.WithdrawalStatus.COMPLETED);
+        assertThat(withdrawal.getExternalRef()).isEqualTo("rail-ref-1");
+        assertThat(originalTx.getStatus()).isEqualTo(TransactionStatus.COMPLETED);
+    }
+
+    @Test
+    void applyPayoutResult_onFailure_reversesViaNewTransaction_andCreditsMerchantBackInFull() {
+        Withdrawal withdrawal = pendingWithdrawal();
+        MoneyTransaction originalTx = MoneyTransaction.builder().id(withdrawal.getTransactionId()).status(TransactionStatus.PENDING).build();
+        when(withdrawalRepository.findByPublicIdForUpdate("wd-1")).thenReturn(Optional.of(withdrawal));
+        when(transactionRepository.getReferenceById(withdrawal.getTransactionId())).thenReturn(originalTx);
+        Account merchantAccount = account(MERCHANT_ID, 1L, "ZAR", 3000L);
+        Account systemAccount = account(Merchant.SYSTEM_MERCHANT_ID, 2L, "ZAR", 2000L);
+        when(accountService.lockOrCreateAccount(MERCHANT_ID, "ZAR")).thenReturn(merchantAccount);
+        when(accountService.lockOrCreateAccount(Merchant.SYSTEM_MERCHANT_ID, "ZAR")).thenReturn(systemAccount);
+
+        executor.applyPayoutResult("wd-1", false, null, "rail rejected");
+
+        ArgumentCaptor<MoneyTransaction> reversalCaptor = ArgumentCaptor.forClass(MoneyTransaction.class);
+        verify(transactionRepository).save(reversalCaptor.capture());
+        MoneyTransaction reversal = reversalCaptor.getValue();
+        assertThat(reversal.getType()).isEqualTo(TransactionType.WITHDRAWAL_REVERSAL);
+        assertThat(reversal.getIdempotencyKey()).isEqualTo(withdrawal.getIdempotencyKey() + ":reversal");
+
+        verify(accountService).debit(systemAccount, 2000L, reversal);
+        verify(accountService).credit(merchantAccount, 2000L, reversal);
+        assertThat(withdrawal.getStatus()).isEqualTo(Withdrawal.WithdrawalStatus.FAILED);
+        assertThat(withdrawal.getFailureReason()).isEqualTo("rail rejected");
+        assertThat(originalTx.getStatus()).isEqualTo(TransactionStatus.FAILED);
+    }
+
+    @Test
+    void applyPayoutResult_duplicateCallbackOnAlreadyTerminalWithdrawal_isANoOp() {
+        // The rail (or a real webhook) redelivers a notification for a
+        // withdrawal that was already completed by an earlier callback.
+        Withdrawal withdrawal = pendingWithdrawal();
+        withdrawal.setStatus(Withdrawal.WithdrawalStatus.COMPLETED);
+        when(withdrawalRepository.findByPublicIdForUpdate("wd-1")).thenReturn(Optional.of(withdrawal));
+
+        executor.applyPayoutResult("wd-1", true, "rail-ref-2", null);
+
+        verifyNoInteractions(accountService);
+        verify(transactionRepository, never()).save(any());
+        assertThat(withdrawal.getExternalRef()).isNull(); // untouched by the duplicate callback
+    }
+
+    @Test
+    void applyPayoutResult_unknownWithdrawal_throwsNotFound() {
+        when(withdrawalRepository.findByPublicIdForUpdate("missing")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> executor.applyPayoutResult("missing", true, "ref", null))
+                .isInstanceOf(NotFoundException.class);
+    }
+
+    private Withdrawal pendingWithdrawal() {
+        Withdrawal w = Withdrawal.builder()
+                .merchantId(MERCHANT_ID).accountId(1L).transactionId(10L)
+                .amountMinor(2000L).currencyCode("ZAR").destination("acc-123")
+                .status(Withdrawal.WithdrawalStatus.PENDING).idempotencyKey("idem-1")
+                .build();
+        w.setPublicId("wd-1");
+        return w;
+    }
+
+    private Account account(long merchantId, long id, String currency, long balance) {
+        Account a = Account.builder().merchantId(merchantId).currencyCode(currency).balanceMinor(balance).build();
+        a.setId(id);
+        return a;
+    }
+}
+</file>
+
+<file path="src/test/java/com/ezeebit/wallet/service/WithdrawalServiceTest.java">
+package com.ezeebit.wallet.service;
+
+import com.ezeebit.wallet.domain.MoneyTransaction;
+import com.ezeebit.wallet.domain.TransactionStatus;
+import com.ezeebit.wallet.domain.TransactionType;
+import com.ezeebit.wallet.domain.Withdrawal;
+import com.ezeebit.wallet.exception.InsufficientBalanceException;
+import com.ezeebit.wallet.repository.WithdrawalRepository;
+import com.ezeebit.wallet.service.payout.PayoutRailClient;
+import com.ezeebit.wallet.web.dto.WithdrawalRequest;
+import com.ezeebit.wallet.web.dto.WithdrawalResponse;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class WithdrawalServiceTest {
+
+    @Mock TransactionService transactionService;
+    @Mock WithdrawalRepository withdrawalRepository;
+    @Mock PayoutRailClient payoutRailClient;
+    @Mock WithdrawalExecutor withdrawalExecutor;
+
+    WithdrawalService withdrawalService;
+    static final Long MERCHANT_ID = 1L;
+
+    @BeforeEach
+    void setUp() {
+        withdrawalService = new WithdrawalService(transactionService, withdrawalRepository, payoutRailClient, withdrawalExecutor);
+    }
+
+    @Test
+    void initiateWithdrawal_happyPath_reservesFundsThenCallsRailAfterCommit() {
+        MoneyTransaction pending = MoneyTransaction.builder().id(1L).merchantId(MERCHANT_ID)
+                .type(TransactionType.WITHDRAWAL).status(TransactionStatus.PENDING).idempotencyKey("k1").build();
+        when(transactionService.claim(eq(MERCHANT_ID), eq(TransactionType.WITHDRAWAL), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(pending, true));
+        Withdrawal saved = Withdrawal.builder().merchantId(MERCHANT_ID).accountId(1L).transactionId(1L)
+                .amountMinor(500L).currencyCode("ZAR").destination("bank-acc")
+                .status(Withdrawal.WithdrawalStatus.PENDING).idempotencyKey("k1").build();
+        saved.setPublicId("wd-1");
+        WithdrawalRequest request = new WithdrawalRequest("ZAR", 500L, "bank-acc", "k1");
+        when(withdrawalExecutor.reserveFunds(pending, MERCHANT_ID, request)).thenReturn(saved);
+
+        WithdrawalResponse response = withdrawalService.initiateWithdrawal(MERCHANT_ID, request);
+
+        assertThat(response.withdrawalId()).isEqualTo("wd-1");
+        assertThat(response.status()).isEqualTo("PENDING");
+        verify(payoutRailClient).initiatePayout(new PayoutRailClient.PayoutRequest("wd-1", "ZAR", 500L, "bank-acc"));
+    }
+
+    @Test
+    void initiateWithdrawal_replayedIdempotencyKey_neverReservesFundsTwiceOrCallsRailAgain() {
+        // The dashboard fired the same withdrawal request twice over a flaky connection.
+        MoneyTransaction alreadyPending = MoneyTransaction.builder().id(1L).merchantId(MERCHANT_ID)
+                .type(TransactionType.WITHDRAWAL).status(TransactionStatus.PENDING).idempotencyKey("k1").build();
+        when(transactionService.claim(eq(MERCHANT_ID), eq(TransactionType.WITHDRAWAL), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(alreadyPending, false));
+        Withdrawal existing = Withdrawal.builder().merchantId(MERCHANT_ID).accountId(1L).transactionId(1L)
+                .amountMinor(500L).currencyCode("ZAR").destination("bank-acc")
+                .status(Withdrawal.WithdrawalStatus.PENDING).idempotencyKey("k1").build();
+        existing.setPublicId("wd-1");
+        when(withdrawalRepository.findByTransactionId(1L)).thenReturn(Optional.of(existing));
+
+        WithdrawalResponse response = withdrawalService.initiateWithdrawal(MERCHANT_ID,
+                new WithdrawalRequest("ZAR", 500L, "bank-acc", "k1"));
+
+        assertThat(response.withdrawalId()).isEqualTo("wd-1");
+        verifyNoInteractions(withdrawalExecutor);
+        verifyNoInteractions(payoutRailClient);
+    }
+
+    @Test
+    void initiateWithdrawal_whenReservationFails_marksFailedAndNeverCallsRail() {
+        MoneyTransaction pending = MoneyTransaction.builder().id(1L).merchantId(MERCHANT_ID)
+                .type(TransactionType.WITHDRAWAL).status(TransactionStatus.PENDING).idempotencyKey("k1").build();
+        when(transactionService.claim(eq(MERCHANT_ID), eq(TransactionType.WITHDRAWAL), eq("k1"), any()))
+                .thenReturn(new TransactionService.ClaimResult(pending, true));
+        when(withdrawalExecutor.reserveFunds(eq(pending), eq(MERCHANT_ID), any()))
+                .thenThrow(new InsufficientBalanceException("not enough funds"));
+
+        assertThatThrownBy(() -> withdrawalService.initiateWithdrawal(MERCHANT_ID,
+                new WithdrawalRequest("ZAR", 500L, "bank-acc", "k1")))
+                .isInstanceOf(InsufficientBalanceException.class);
+
+        verify(transactionService).markFailed(1L, "not enough funds");
+        verifyNoInteractions(payoutRailClient);
+    }
+
+    @Test
+    void handlePayoutResult_delegatesToExecutor() {
+        withdrawalService.handlePayoutResult("wd-1", true, "ref-1", null);
+
+        verify(withdrawalExecutor).applyPayoutResult("wd-1", true, "ref-1", null);
+    }
+}
+</file>
+
+<file path="pom.xml">
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.4</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.ezeebit</groupId>
+    <artifactId>wallet</artifactId>
+    <version>0.1.0</version>
+    <name>ezeebit-wallet</name>
+    <description>Ezeebit backend take-home: merchant wallet, conversion, withdrawal</description>
+
+    <properties>
+        <java.version>17</java.version>
+        <lombok.version>1.18.42</lombok.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+</file>
+
+<file path="README.md">
+# Ezeebit Wallet Service (Take-Home)
+
+Java 17 + Spring Boot 3.3 + MySQL 8, implementing Tasks 1, 2 and 3 from the brief: holding merchant balances across currencies, converting between currencies, and withdrawing funds out of the platform.
+
+See **SOLUTION.md** for the design write-up, trade-offs, and how Tasks 4-6 would slot into the same architecture.
+
+---
+
+## Prerequisites
+
+- **Java 17**
+- **Maven 3.9+** (or local `mvn` CLI)
+- **MySQL 8** running locally (or via Docker)
+
+---
+
+## 1. Start MySQL
+
+Run the container and wait for MySQL to complete initialization before executing the app:
+
+```bash
+docker run --name ezeebit-mysql -e MYSQL_ROOT_PASSWORD=root \
+  -e MYSQL_DATABASE=ezeebit_wallet \
+  -e MYSQL_USER=ezeebit -e MYSQL_PASSWORD=ezeebit \
+  -p 3306:3306 -d mysql:8.0 && \
+until docker exec ezeebit-mysql mysqladmin ping -h 127.0.0.1 -u ezeebit -pezeebit --silent; do
+  echo "Waiting for MySQL initialization..."
+  sleep 2
+done
+```
+
+*(Or point `src/main/resources/application.yml` at an existing MySQL instance - just update the `spring.datasource` block.)*
+
+---
+
+## 2. Run the App
+
+If port 8080 is occupied by a previously running process, terminate it first:
+
+```bash
+kill -9 $(lsof -t -i:8080)
+```
+
+Start the service:
+
+```bash
+# Using local Maven CLI
+mvn spring-boot:run
+
+# Or using the Maven Wrapper (grant execution permissions first if needed)
+chmod +x mvnw && ./mvnw spring-boot:run
+```
+
+Flyway runs automatically on startup and creates the schema plus seed data:
+
+- **Supported Currencies:** `ZAR`, `NGN`, `KES`, `USDT`, `USDC` *(Note: Requests with non-seeded currencies like `USD` will return `404 NOT_FOUND`)*
+- **Reserved Merchant:** `SYSTEM` (id `0`) used internally for double-entry clearing accounts (see `SOLUTION.md`).
+- **Demo Merchants:** `1` ("iStore Cape Town") and `2` ("Sunbet Online").
+
+The app listens on `http://localhost:8080`.
+
+---
+
+## 3. Run the Tests
+
+```bash
+mvn test
+```
+
+Unit tests cover the money-safety logic in isolation (Mockito, no DB required): `AccountService`, `TransactionService`'s idempotency claim/finalize lifecycle, and the three tasks' executors, including duplicate-request and insufficient-funds failure paths.
+
+---
+
+## 4. Try It Out
+
+### Deposit ZAR into Merchant 1
+```bash
+curl -i -X POST http://localhost:8080/merchants/1/deposits \
+  -H 'Content-Type: application/json' \
+  -d '{"currency":"ZAR","amountMinor":100000,"idempotencyKey":"dep-1"}'
+```
+
+### Test Idempotency Replay (Retry same request)
+```bash
+curl -i -X POST http://localhost:8080/merchants/1/deposits \
+  -H 'Content-Type: application/json' \
+  -d '{"currency":"ZAR","amountMinor":100000,"idempotencyKey":"dep-1"}'
+```
+Returns the existing transaction payload (`HTTP 201`) without throwing session/hibernate errors or duplicating ledger entries.
+
+### Check Balances
+```bash
+curl -i http://localhost:8080/merchants/1/balances
+```
+
+### Test Concurrent Account Provisioning (Merchant 2 with ZAR)
+```bash
+seq 2 | xargs -n 1 -P 2 -I {} curl -i -X POST http://localhost:8080/merchants/2/deposits \
+  -H "Content-Type: application/json" \
+  -d '{"currency":"ZAR","amountMinor":50000,"idempotencyKey":"dep-zar-concurrent-{}"}'
+```
+Verifies `lockOrCreateAccount` handles concurrent creation under parallel threads without deadlocks or lock wait timeouts.
+
+### Full Audit Trail for One Currency
+```bash
+curl -i http://localhost:8080/merchants/1/balances/ZAR/statement
+```
+
+### Convert ZAR to USDT (Quote, then execute)
+```bash
+QUOTE=$(curl -s -X POST http://localhost:8080/merchants/1/quotes \
+  -H 'Content-Type: application/json' \
+  -d '{"fromCurrency":"ZAR","toCurrency":"USDT","fromAmountMinor":50000}')
+echo $QUOTE
+
+QUOTE_ID=$(echo $QUOTE | grep -o '"quoteId":"[^"]*"' | cut -d'"' -f4)
+
+curl -i -X POST http://localhost:8080/merchants/1/conversions \
+  -H 'Content-Type: application/json' \
+  -d "{\"quoteId\":\"$QUOTE_ID\",\"idempotencyKey\":\"conv-1\"}"
+```
+
+### Withdraw Funds
+*(Async - watch the balance/status settle a couple seconds later)*
+```bash
+curl -i -X POST http://localhost:8080/merchants/1/withdrawals \
+  -H 'Content-Type: application/json' \
+  -d '{"currency":"ZAR","amountMinor":10000,"destination":"acc-123","idempotencyKey":"wd-1"}'
+```
+The response comes back `PENDING` immediately (funds are already reserved). `MockPayoutRailClient` resolves it a couple of seconds later - poll balances or the transaction to see it settle to `COMPLETED` (or `FAILED`, ~10% of the time, simulating an unreliable rail - the reserved funds are then credited back automatically).
+
+---
+
+## Project Layout
+
+```
+domain/                  JPA entities (Account, MoneyTransaction, LedgerEntry, ConversionQuote, Withdrawal, ...)
+repository/              Spring Data repositories, including the pessimistic-lock queries
+service/                 Business logic - see SOLUTION.md for the design
+service/exchangerate,
+service/payout           Mocked "already exists" dependencies
+web/                     REST controllers + DTOs + error handling
+resources/db/migration   Flyway schema + seed data
+```
+</file>
+
+<file path="SOLUTION.md">
+# Solution
+
+Tasks chosen: **1 (hold balances), 2 (convert), 3 (withdraw)**. They form a natural progression—you can't convert or withdraw money you can't safely hold—and together they exercise everything required for currency safety, correctness under duplicate or concurrent requests, and a full audit trail.
+
+## Core model
+
+Two ideas run through all three tasks:
+
+**1. Double-entry, immutable ledger.** `Account` (one row per merchant per currency) holds a cached `balanceMinor`, but the *source of truth* is `LedgerEntry`—an append-only table of debits and credits. Nothing is ever updated or deleted there. "How did this balance reach its current value" is always answerable by reading `ledger_entries` for that account, in order. Money is never mixed across currencies: every entry belongs to exactly one `Account`, which belongs to exactly one currency, and amounts are integer minor units (cents / smallest stablecoin unit)—never floating point.
+
+**2. Idempotency via a unique constraint, not a flag.** Every write operation (`DepositService`, `ConversionService`, `WithdrawalService`) takes an `idempotencyKey` and calls `TransactionService.claim()` first. That inserts a `MoneyTransaction` row and relies on a DB-level `UNIQUE(merchant_id, idempotency_key)` constraint: if the dashboard fires the same request twice over a flaky connection, the second insert fails, and the second caller is handed back the *first* request's outcome instead of re-executing anything. This is race-safe by construction—it doesn't depend on a check-then-act sequence in application code, which is exactly the kind of thing that breaks under real concurrency.
+
+Balance mutations are additionally serialized with `SELECT ... FOR UPDATE` (`AccountRepository.findForUpdate`) inside a single local transaction, so two requests touching the *same* account (e.g. two different idempotency keys, or a deposit racing a withdrawal) can't interleave their read-check-write.
+
+**A Spring gotcha worth flagging explicitly:** each of the three `*Service` classes has a matching `*Executor` bean that actually does the transactional work (`DepositExecutor`, `ConversionExecutor`, `WithdrawalExecutor`), rather than the `Service` calling a `@Transactional` method on itself. Spring's `@Transactional` is proxy-based; a class calling its own method (`this.execute(...)`) bypasses the proxy and the annotation is silently ignored. Splitting into a second bean and calling through it is what actually gets you a new transaction boundary. Same reasoning applies to `AccountProvisioner`: it's split out from `AccountService` because catching a failed-insert exception and continuing to use the *same* Hibernate persistence context is unsafe—a flush failure leaves that session unusable—so the "try to create, it's fine if I lose the race" logic needs its own dedicated, isolated transaction.
+
+## Task 1 - holding balances
+
+`DepositService` → `DepositExecutor`: claim idempotency, lock-or-create the target `Account`, credit it, write the `LedgerEntry`, mark the transaction `COMPLETED`. If anything throws, the transaction is marked `FAILED` (still fully auditable—we know a deposit was attempted and why it didn't land).
+
+`GET /merchants/{id}/balances` and `GET /merchants/{id}/balances/{ccy}/statement` expose the current balance and its full ledger history.
+
+## Task 2 - converting currencies
+
+**Quote-then-execute.** `POST /quotes` calls the exchange-rate feed once and locks that price into a short-lived `ConversionQuote` row (TTL default 20s). `POST /conversions` spends a quote id: it re-validates the quote (not expired, not already used, belongs to this merchant) under a row lock, and only *then* checks the merchant's balance and moves the money. This is what stops the platform ending up on the wrong side of a moving market—Ezeebit's price exposure on any single quote is bounded to the TTL window, and the merchant always converts at a price they actually saw.
+
+**Crossing two currencies without breaking double-entry.** A conversion can't be a single balanced ledger posting, because it spans two different currencies' books. The design uses a reserved `SYSTEM` merchant (id `0`, seeded in `V2__seed_reference_data.sql`) with one clearing account per currency, and posts two independent, single-currency balanced entries:
+
+debit  merchant / FROM_CCY   ->  credit SYSTEM / FROM_CCY
+debit  SYSTEM   / TO_CCY     ->  credit merchant / TO_CCY
+
+The `SYSTEM` accounts are the one exception to "balances never go negative" (enforced both in `AccountService.debit` and via a DB `CHECK` constraint)—that negative number *is* the platform's real, short-term FX exposure between the two legs.
+
+**Deadlock avoidance.** A conversion locks four accounts (merchant × 2 currencies, system × 2 currencies). Two concurrent conversions between the same currency pair (even in opposite directions) could deadlock if they lock in different orders. `ConversionExecutor` always locks in a fixed, currency-alphabetical order (e.g. `USDT` before `ZAR`).
+
+**Rounding.** Converted amounts are floored (`RoundingMode.DOWN`) to the target currency's minor unit, so the platform never rounds in the merchant's favour by accident.
+
+## Task 3 - withdrawals
+
+Two-phase, because the payout rail is asynchronous:
+
+1. **`initiateWithdrawal`** (`WithdrawalExecutor.reserveFunds`, under the idempotency claim): lock the merchant's account, check they hold the funds, debit immediately, credit a `SYSTEM` "withdrawal suspense" account, write a `PENDING` `Withdrawal` row. Only *after* that transaction commits does the code call the external payout rail—never from inside the DB transaction, so a slow rail call can't hold a lock open.
+2. **`handlePayoutResult`** (`WithdrawalExecutor.applyPayoutResult`): the rail's callback. Locks the `Withdrawal` row and checks it's still `PENDING`/`PROCESSING`—if it's already terminal, the call is a no-op, making duplicate notifications safe. On success, the suspense entry is cleared. On failure, funds are returned to the merchant via a **brand new `WITHDRAWAL_REVERSAL` transaction**—reversals are never done by editing original ledger entries.
+
+## How Tasks 4-6 would fit
+
+- **Task 4 (incoming crypto payment).** Slots in as another producer into the same `Account`/`LedgerEntry` model, fed by a blockchain confirmation webhook using the transaction hash as the idempotency key.
+- **Task 5 (auto-settle to local currency).** A rule evaluated immediately after a deposit posts: take a percentage of newly credited stablecoins and run them directly through the `ConversionService` pipeline.
+- **Task 6 (route payouts across countries/partners).** `WithdrawalExecutor` already separates reserving funds from executing payouts; a `PayoutRouter` sits between them to handle partner selection and retries before triggering a reversal.
+
+## Trade-offs and what I'd do with more time
+
+- **AI for boilerplate code.** AI was used to generate repetitive boilerplate code (like DTOs, basic repository methods, and controllers), allowing time to be focused on core transaction logic, concurrency control, and double-entry correctness.
+- **Integration tests.** Add a `@SpringBootTest` + Testcontainers MySQL suite to verify actual SQL execution, Flyway migrations, and multi-threaded lock behavior under real database concurrency.
+- **SYSTEM clearing accounts.** Connect clearing accounts to actual treasury balances and split FX clearing from withdrawal suspense accounts.
+- **Observability & pagination.** Add pagination to statement endpoints, apply spread margins to conversion quotes, and add metrics tracking quote expiration and reversal rates.
+</file>
+
+</files>

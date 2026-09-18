@@ -1,0 +1,7 @@
+com/ezeebit/wallet/service/WithdrawalServiceTest.class
+com/ezeebit/wallet/service/WithdrawalExecutorTest.class
+com/ezeebit/wallet/service/ConversionServiceTest.class
+com/ezeebit/wallet/service/AccountServiceTest.class
+com/ezeebit/wallet/service/DepositServiceTest.class
+com/ezeebit/wallet/service/TransactionServiceTest.class
+com/ezeebit/wallet/service/ConversionExecutorTest.class
